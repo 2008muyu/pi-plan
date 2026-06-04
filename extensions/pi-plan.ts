@@ -636,7 +636,7 @@ export default function piPlan(pi: ExtensionAPI): void {
     description: 'Configure plan/exec models (picks from your configured providers).',
     handler: async (_args, ctx) => {
       const cfg = loadConfig();
-      const allModels = ctx.modelRegistry?.getAll() || [];
+      const allModels = ctx.modelRegistry?.getAvailable() || [];
       if (allModels.length === 0) { ctx.ui.notify('No models configured. Use /login first.', 'error'); return; }
 
       // Group by provider
