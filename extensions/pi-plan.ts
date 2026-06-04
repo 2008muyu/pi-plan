@@ -14,7 +14,6 @@
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { getKeybindings, Key, matchesKey } from '@earendil-works/pi-tui';
-import { showPromptDialog } from '@2008muyu/pi-ui-prompt-dialog';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
@@ -794,22 +793,12 @@ function writePlanFiles(name: string, data: PlanData): void {
   // plan mode on the spot, type alternative instructions, or cancel.
 
   async function promptOnBlock(ctx: ExtensionContext, originalReason: string): Promise<{ block: true; reason: string } | undefined> {
-    const result = await showPromptDialog(ctx, {
-      title: 'Plan 模式拦截了此操作',
-      description: originalReason,
-      actions: [
-        { id: 'exit', label: '退出并执行', default: true },
-        { id: 'cancel', label: '取消' },
-      ],
-      input: { label: '补充指令', placeholder: '想让我怎么做？' },
-    });
+    const choice = await ctx.ui.select('Plan 模式拦截了此操作', [
+      '退出并执行',
+      '取消',
+    ]);
 
-    if (!result) {
-      // User pressed Escape — same as Cancel.
-      return { block: true, reason: originalReason };
-    }
-
-    if (result.type === 'action' && result.action === 'exit') {
+    if (choice === '退出并执行') {
       await exitPlanMode(ctx);
       // Returning undefined = allow the tool call. After exitPlanMode both
       // planModeEnabled and executing are false, so this handler won't
@@ -817,13 +806,7 @@ function writePlanFiles(name: string, data: PlanData): void {
       return undefined;
     }
 
-    if (result.type === 'input') {
-      if (result.value.trim()) {
-        return { block: true, reason: `${originalReason}\n---\n用户补充: ${result.value.trim()}` };
-      }
-    }
-
-    // Cancel action / empty input / fallthrough
+    // Cancel / Escape / fallthrough
     return { block: true, reason: originalReason };
   }
 
