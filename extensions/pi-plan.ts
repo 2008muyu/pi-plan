@@ -13,7 +13,8 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
-import { Container, DynamicBorder, getKeybindings, Key, Text, matchesKey } from '@earendil-works/pi-tui';
+import { getKeybindings, Key, matchesKey } from '@earendil-works/pi-tui';
+import { showPromptDialog } from '@2008muyu/pi-ui-prompt-dialog';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
@@ -208,6 +209,46 @@ export default function piPlan(pi: ExtensionAPI): void {
     pi.appendEntry('pi-plan', { planDir: activePlanDir, planEnabled: planModeEnabled, executing, plan, executionStartIdx } as any);
   }
 
+  // ── Below-editor indicator ────────────────────────────────────────────────
+  //
+  // Renders a colored banner below the input box so the user always knows
+  // whether they're in plan mode, execution mode, or neither.
+  //
+  // Coloring strategy:
+  //   - Plan mode   → purple (raw ANSI 141 = bright magenta/violet)
+  //   - Execution   → blue   (raw ANSI 75  = bright steel blue)
+  //   - Tool name   → theme accent (theme-aware)
+  //   - Muted text  → theme muted
+  // Falls back gracefully if the terminal doesn't support 256-color (raw
+  // escapes are simply ignored on most terms; on no-color terms they're stripped).
+  const PURPLE = '\x1b[1;38;5;141m';
+  const BLUE   = '\x1b[1;38;5;75m';
+  const RESET  = '\x1b[0m';
+
+  function updatePlanIndicator(ctx: ExtensionContext): void {
+    if (!ctx.hasUI) return;
+    const t = ctx.ui.theme;
+    let line: string | undefined;
+
+    if (planModeEnabled) {
+      const head = `${PURPLE}🧭 PLAN MODE${RESET}`;
+      const tail = t.fg('muted', ' · read-only tools · strong model · /plan to exit');
+      line = `${head}  ${tail}`;
+    } else if (executing && plan) {
+      const done = plan.tasks.filter(x => x.status === 'done' || x.status === 'skipped').length;
+      const total = plan.tasks.length;
+      const blocked = plan.tasks.filter(x => x.status === 'blocked').length;
+      const head = `${BLUE}⚙ EXECUTING${RESET}`;
+      const title = t.fg('accent', `“${plan.title}”`);
+      const progress = t.fg('muted', `${done}/${total} tasks`);
+      const blockedTag = blocked > 0 ? '  ' + t.fg('error', `✗ ${blocked} blocked`) : '';
+      line = `${head}  ${title}  ${progress}${blockedTag}  ${t.fg('muted', '· /plan to abort')}`;
+    }
+
+    if (line) ctx.ui.setWidget('pi-plan-indicator', [line], { placement: 'belowEditor' });
+    else      ctx.ui.setWidget('pi-plan-indicator', undefined);
+  }
+
   function restoreState(ctx: ExtensionContext): void {
     const entries = ctx.sessionManager.getEntries() as Array<{ type: string; customType?: string; data?: any }>;
     const saved = entries.filter(e => e.type === 'custom' && e.customType === 'pi-plan').pop();
@@ -220,6 +261,7 @@ export default function piPlan(pi: ExtensionAPI): void {
     }
     if (pi.getFlag('plan') === true) planModeEnabled = true;
     if (planModeEnabled) pi.setActiveTools(PLAN_TOOLS);
+    updatePlanIndicator(ctx);
   }
 
   // ── Model switching ────────────────────────────────────────────────────────
@@ -252,7 +294,13 @@ export default function piPlan(pi: ExtensionAPI): void {
 
   // ── File persistence for plans ─────────────────────────────────────────────
 
-  function writePlanFiles(name: string, data: PlanData): void {
+  // ── Result helper ───────────────────────────────────────────────────────────
+
+function ok(text: string, details?: Record<string, unknown>) {
+  return { content: [{ type: 'text' as const, text }], details: details ?? {} };
+}
+
+function writePlanFiles(name: string, data: PlanData): void {
     const dir = planDir(name);
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, 'PLAN.md'), `# ${data.title}\n\n${data.handoff}\n`, 'utf8');
@@ -303,6 +351,8 @@ export default function piPlan(pi: ExtensionAPI): void {
     }
     pi.setThinkingLevel(config.planThinking as any);
     ctx.ui.notify(`Plan mode ON — ${config.planProvider}/${config.planModel}:${config.planThinking}`, 'info');
+    persistState();
+    updatePlanIndicator(ctx);
   }
 
   async function startExecution(ctx: ExtensionContext): Promise<void> {
@@ -323,6 +373,7 @@ export default function piPlan(pi: ExtensionAPI): void {
     pi.setThinkingLevel(config.execThinking as any);
     ctx.ui.notify(`Executing — ${config.execProvider}/${config.execModel}:${config.execThinking}`, 'info');
     persistState();
+    updatePlanIndicator(ctx);
   }
 
   async function exitPlanMode(ctx: ExtensionContext): Promise<void> {
@@ -334,6 +385,7 @@ export default function piPlan(pi: ExtensionAPI): void {
     if (previousThinking) pi.setThinkingLevel(previousThinking as any);
     ctx.ui.notify('Plan mode OFF', 'info');
     persistState();
+    updatePlanIndicator(ctx);
   }
 
   // ── Task update helper ─────────────────────────────────────────────────────
@@ -386,9 +438,9 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['name', 'title', 'handoff', 'tasks'],
     } as any,
-    execute: async (_id, args) => {
+    execute: async (_id: string, args: any, _signal: AbortSignal | undefined, _onUpdate: any, ctx: ExtensionContext) => {
       const tasks = args.tasks || [];
-      if (tasks.length === 0) return 'No tasks provided.';
+      if (tasks.length === 0) return ok('No tasks provided.');
       const now = new Date().toISOString();
       const data: PlanData = {
         title: args.title,
@@ -406,7 +458,8 @@ export default function piPlan(pi: ExtensionAPI): void {
       activePlanDir = planDir(args.name);
       plan = data;
       persistState();
-      return `Plan "${args.title}" (${args.name}) saved with ${data.tasks.length} tasks.`;
+      updatePlanIndicator(ctx);
+      return ok(`Plan "${args.title}" (${args.name}) saved with ${data.tasks.length} tasks.`, { name: args.name, taskCount: data.tasks.length });
     },
   } as any);
 
@@ -434,10 +487,11 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['name'],
     } as any,
-    execute: async (_id, args) => {
-      if (!existsSync(dir)) return `No plan "${args.name}" found.`;
+    execute: async (_id: string, args: any, _signal: AbortSignal | undefined, _onUpdate: any, ctx: ExtensionContext) => {
+      const dir = planDir(args.name);
+      if (!existsSync(dir)) return ok(`No plan "${args.name}" found.`);
       const existing = readPlanFromDisk(dir);
-      if (!existing) return `Plan "${args.name}" data corrupted.`;
+      if (!existing) return ok(`Plan "${args.name}" data corrupted.`);
       const now = new Date().toISOString();
       if (args.title) existing.title = args.title;
       if (args.handoff) existing.handoff = args.handoff;
@@ -459,7 +513,8 @@ export default function piPlan(pi: ExtensionAPI): void {
       activePlanDir = dir;
       plan = existing;
       persistState();
-      return `Plan "${args.name}" revised.`;
+      updatePlanIndicator(ctx);
+      return ok(`Plan "${args.name}" revised.`, { taskCount: existing.tasks.length });
     },
   } as any);
 
@@ -475,10 +530,11 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['task_id', 'status'],
     } as any,
-    execute: async (_id, args) => {
-      if (!plan || !activePlanDir) return 'No active plan.';
+    execute: async (_id: string, args: any, _signal: AbortSignal | undefined, _onUpdate: any, ctx: ExtensionContext) => {
+      if (!plan || !activePlanDir) return ok('No active plan.');
       await updateTaskInPlan(args.task_id, args.status, args.notes);
-      return `Task ${args.task_id} marked ${args.status}.`;
+      updatePlanIndicator(ctx);
+      return ok(`Task ${args.task_id} marked ${args.status}.`, { task_id: args.task_id, status: args.status });
     },
   } as any);
 
@@ -503,10 +559,11 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['updates'],
     } as any,
-    execute: async (_id, args) => {
-      if (!plan || !activePlanDir) return 'No active plan.';
+    execute: async (_id: string, args: any, _signal: AbortSignal | undefined, _onUpdate: any, ctx: ExtensionContext) => {
+      if (!plan || !activePlanDir) return ok('No active plan.');
       for (const u of args.updates) await updateTaskInPlan(u.task_id, u.status, u.notes);
-      return `${args.updates.length} tasks updated.`;
+      updatePlanIndicator(ctx);
+      return ok(`${args.updates.length} tasks updated.`, { count: args.updates.length });
     },
   } as any);
 
@@ -523,8 +580,8 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['description', 'reason'],
     } as any,
-    execute: async (_id, args) => {
-      if (!plan || !activePlanDir) return 'No active plan.';
+    execute: async (_id: string, args: any, _signal: AbortSignal | undefined, _onUpdate: any, ctx: ExtensionContext) => {
+      if (!plan || !activePlanDir) return ok('No active plan.');
       const now = new Date().toISOString();
       const taskId = `t-${String(plan.tasks.length + 1).padStart(3, '0')}`;
       const task: TaskRecord = {
@@ -544,7 +601,8 @@ export default function piPlan(pi: ExtensionAPI): void {
         ...plan.tasks,
       ]);
       persistState();
-      return `Follow-up "${args.description}" captured as ${taskId} (deferred). Review via /plan resume.`;
+      updatePlanIndicator(ctx);
+      return ok(`Follow-up "${args.description}" captured as ${taskId} (deferred). Review via /plan resume.`, { task_id: taskId });
     },
   } as any);
 
@@ -557,13 +615,13 @@ export default function piPlan(pi: ExtensionAPI): void {
         plan: { type: 'string', description: 'Plan name (optional)' },
       },
     } as any,
-    execute: async (_id, args) => {
+    execute: async (_id: string, _args: any, _signal: AbortSignal | undefined, _onUpdate: any, _ctx: ExtensionContext) => {
       if (plan) {
         const done = plan.tasks.filter(t => t.status === 'done').length;
         const total = plan.tasks.length;
-        return `Plan: ${plan.title} (${plan.planName})\nProgress: ${done}/${total} tasks complete`;
+        return ok(`Plan: ${plan.title} (${plan.planName})\nProgress: ${done}/${total} tasks complete`, { done, total });
       }
-      return 'No active plan.';
+      return ok('No active plan.');
     },
   } as any);
 
@@ -571,9 +629,9 @@ export default function piPlan(pi: ExtensionAPI): void {
     name: 'reconcile_plans',
     description: 'Detect & repair drift between tasks.jsonl and the registry.',
     parameters: { type: 'object', properties: {} } as any,
-    execute: async () => {
+    execute: async (_id: string, _signal: AbortSignal | undefined, _onUpdate: any, _ctx: ExtensionContext) => {
       const manifestPath = join(PLANS_ROOT, 'plans.jsonl');
-      if (!existsSync(manifestPath)) return 'No plans directory.';
+      if (!existsSync(manifestPath)) return ok('No plans directory.');
       const entries = readJsonl<any>(manifestPath);
       let report = '';
       for (const entry of entries) {
@@ -589,16 +647,26 @@ export default function piPlan(pi: ExtensionAPI): void {
         }
       }
       writeJsonl(manifestPath, entries);
-      return report || 'No drift detected.';
+      return ok(report || 'No drift detected.');
     },
   } as any);
 
   // ── Commands ───────────────────────────────────────────────────────────────
 
   pi.registerCommand('plan', {
-    description: 'Enter plan mode. "/plan resume" picks up an existing plan.',
+    description: 'Enter plan mode. "/plan resume" picks up an existing plan. "/plan exit" leaves plan or exec mode.',
     handler: async (args, ctx) => {
       const trimmed = args?.trim();
+
+      // ── /plan exit | off | out : immediate exit, no dialog ─────────────────
+      if (trimmed === 'exit' || trimmed === 'off' || trimmed === 'out') {
+        if (!planModeEnabled && !executing) {
+          ctx.ui.notify('Not in plan mode.', 'info');
+          return;
+        }
+        await exitPlanMode(ctx);
+        return;
+      }
 
       if (trimmed === 'resume') {
         // Scan .plans/ for in-progress plans
@@ -712,21 +780,66 @@ export default function piPlan(pi: ExtensionAPI): void {
   });
 
   // ── Event: block destructive bash + restrict writes ────────────────────────
+  //
+  // Instead of silently blocking, pop a dialog so the user can either exit
+  // plan mode on the spot, type alternative instructions, or cancel.
 
-  pi.on('tool_call', async (event) => {
+  async function promptOnBlock(ctx: ExtensionContext, originalReason: string): Promise<{ block: true; reason: string } | undefined> {
+    const result = await showPromptDialog(ctx, {
+      title: 'Plan 模式拦截了此操作',
+      description: originalReason,
+      actions: [
+        { id: 'exit', label: '退出并执行', default: true },
+        { id: 'cancel', label: '取消' },
+      ],
+      input: { label: '补充指令', placeholder: '想让我怎么做？' },
+    });
+
+    if (!result) {
+      // User pressed Escape — same as Cancel.
+      return { block: true, reason: originalReason };
+    }
+
+    if (result.type === 'action' && result.action === 'exit') {
+      await exitPlanMode(ctx);
+      // Returning undefined = allow the tool call. After exitPlanMode both
+      // planModeEnabled and executing are false, so this handler won't
+      // fire again for callbacks triggered during the same turn.
+      return undefined;
+    }
+
+    if (result.type === 'input') {
+      if (result.value.trim()) {
+        return { block: true, reason: `${originalReason}\n---\n用户补充: ${result.value.trim()}` };
+      }
+    }
+
+    // Cancel action / empty input / fallthrough
+    return { block: true, reason: originalReason };
+  }
+
+  pi.on('tool_call', async (event, ctx) => {
     if (!planModeEnabled) return;
+
+    let originalReason: string | undefined;
+
     if (event.toolName === 'bash') {
       const cmd = event.input.command as string;
       if (!isSafeCommand(cmd)) {
-        return { block: true, reason: `Plan mode: command blocked. Use /plan to exit plan mode first.\nCommand: ${cmd}` };
+        originalReason = `Plan mode: command blocked. Use /plan to exit plan mode first.\nCommand: ${cmd}`;
       }
     }
-    if (event.toolName === 'write' || event.toolName === 'edit') {
+    if ((event.toolName === 'write' || event.toolName === 'edit') && !originalReason) {
       const p = event.input.path as string;
       if (!isPlanPath(p)) {
-        return { block: true, reason: `Plan mode: writes restricted to .plans/ directory.\nPath: ${p}` };
+        originalReason = `Plan mode: writes restricted to .plans/ directory.\nPath: ${p}`;
       }
     }
+
+    if (!originalReason) return;
+    if (!ctx.hasUI) return { block: true, reason: originalReason };
+
+    return promptOnBlock(ctx, originalReason);
   });
 
   // ── Event: inject phase prompts ────────────────────────────────────────────
@@ -834,6 +947,7 @@ export default function piPlan(pi: ExtensionAPI): void {
         }
       }
     }
+    updatePlanIndicator(ctx);
   });
 
   // ── Event: session_shutdown — cleanup ──────────────────────────────────────
