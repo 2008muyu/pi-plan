@@ -358,13 +358,15 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['name', 'title', 'handoff', 'tasks'],
     } as any,
-    execute: async (args) => {
+    execute: async (_id, args) => {
+      const tasks = args.tasks || [];
+      if (tasks.length === 0) return 'No tasks provided.';
       const now = new Date().toISOString();
       const data: PlanData = {
         title: args.title,
         planName: args.name,
-        handoff: args.handoff,
-        tasks: args.tasks.map((t: any) => ({
+        handoff: args.handoff || '',
+        tasks: tasks.map((t: any) => ({
           ...t,
           status: 'pending' as TaskStatus,
           origin: 'plan' as const,
@@ -404,8 +406,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['name'],
     } as any,
-    execute: async (args) => {
-      const dir = planDir(args.name);
+    execute: async (_id, args) => {
       if (!existsSync(dir)) return `No plan "${args.name}" found.`;
       const existing = readPlanFromDisk(dir);
       if (!existing) return `Plan "${args.name}" data corrupted.`;
@@ -446,7 +447,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['task_id', 'status'],
     } as any,
-    execute: async (args) => {
+    execute: async (_id, args) => {
       if (!plan || !planDir) return 'No active plan.';
       await updateTaskInPlan(args.task_id, args.status, args.notes);
       return `Task ${args.task_id} marked ${args.status}.`;
@@ -474,7 +475,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['updates'],
     } as any,
-    execute: async (args) => {
+    execute: async (_id, args) => {
       if (!plan || !planDir) return 'No active plan.';
       for (const u of args.updates) await updateTaskInPlan(u.task_id, u.status, u.notes);
       return `${args.updates.length} tasks updated.`;
@@ -494,7 +495,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       },
       required: ['description', 'reason'],
     } as any,
-    execute: async (args) => {
+    execute: async (_id, args) => {
       if (!plan || !planDir) return 'No active plan.';
       const now = new Date().toISOString();
       const taskId = `t-${String(plan.tasks.length + 1).padStart(3, '0')}`;
@@ -528,7 +529,7 @@ export default function piPlan(pi: ExtensionAPI): void {
         plan: { type: 'string', description: 'Plan name (optional)' },
       },
     } as any,
-    execute: async (args) => {
+    execute: async (_id, args) => {
       if (plan) {
         const done = plan.tasks.filter(t => t.status === 'done').length;
         const total = plan.tasks.length;
