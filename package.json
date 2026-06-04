@@ -1,0 +1,23 @@
+{
+  "name": "@2008muyu/pi-plan",
+  "version": "1.0.0",
+  "description": "Configurable two-phase planning workflow for pi — plan with a strong model, execute with a light model",
+  "keywords": ["pi-package", "pi-extension", "plan-mode", "planning"],
+  "author": "2008muyu",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/2008muyu/pi-plan.git"
+  },
+  "pi": {
+    "extensions": ["./extensions/pi-plan.ts"],
+    "image": "https://github.com/2008muyu/pi-plan/raw/main/docs/screenshot.png"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}

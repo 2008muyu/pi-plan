@@ -1,0 +1,810 @@
+/**
+ * @2008muyu/pi-plan — 可配置双阶段规划扩展
+ *
+ * Plan with a strong model, execute with a light model.
+ * Models are fully configurable via /plan-config.
+ *
+ * 核心流程:
+ *   /plan → 只读规划(强模型) → submit_plan → 执行(轻模型) → update_task
+ *
+ * 参考:
+ *   - @dreki-gg/pi-plan-mode (phase-transitions.ts / prompts.ts)
+ *   - pi 官方 examples/extensions/plan-mode
+ */
+
+import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { Container, DynamicBorder, getKeybindings, Key, Text, matchesKey } from '@earendil-works/pi-tui';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
+import { homedir } from 'node:os';
+
+// ── Types ───────────────────────────────────────────────────────────────────
+
+type TaskStatus = 'pending' | 'done' | 'skipped' | 'blocked' | 'deferred';
+type PlanStatus = 'in-progress' | 'done' | 'superseded' | 'abandoned';
+
+interface TaskRecord {
+  id: string;
+  description: string;
+  details?: string;
+  status: TaskStatus;
+  depends_on?: string[];
+  notes?: string;
+  origin?: 'plan' | 'discovered';
+  created_at: string;
+  updated_at: string;
+}
+
+interface PlanMeta {
+  title: string;
+  plan_name: string;
+  created_at: string;
+}
+
+interface PlanData {
+  title: string;
+  planName: string;
+  handoff: string;
+  tasks: TaskRecord[];
+}
+
+interface PlanConfig {
+  planProvider: string;
+  planModel: string;
+  planThinking: string;
+  execProvider: string;
+  execModel: string;
+  execThinking: string;
+}
+
+// ── Config ──────────────────────────────────────────────────────────────────
+
+const CONFIG_PATH = join(homedir(), '.pi', 'agent', 'pi-plan.json');
+
+const DEFAULT_CONFIG: PlanConfig = {
+  planProvider: 'anthropic',
+  planModel: 'claude-opus-4-6',
+  planThinking: 'medium',
+  execProvider: 'openai',
+  execModel: 'gpt-5.5',
+  execThinking: 'low',
+};
+
+function loadConfig(): PlanConfig {
+  if (existsSync(CONFIG_PATH)) {
+    try { return { ...DEFAULT_CONFIG, ...JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) }; } catch { /* fall through */ }
+  }
+  return {
+    planProvider: process.env.PI_PLAN_PROVIDER || DEFAULT_CONFIG.planProvider,
+    planModel: process.env.PI_PLAN_MODEL || DEFAULT_CONFIG.planModel,
+    planThinking: process.env.PI_PLAN_THINKING || DEFAULT_CONFIG.planThinking,
+    execProvider: process.env.PI_EXEC_PROVIDER || DEFAULT_CONFIG.execProvider,
+    execModel: process.env.PI_EXEC_MODEL || DEFAULT_CONFIG.execModel,
+    execThinking: process.env.PI_EXEC_THINKING || DEFAULT_CONFIG.execThinking,
+  };
+}
+
+function saveConfig(cfg: PlanConfig): void {
+  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+}
+
+// ── File I/O helpers ────────────────────────────────────────────────────────
+
+const PLANS_ROOT = '.plans';
+
+function planDir(name: string): string { return join(PLANS_ROOT, name); }
+
+function readJsonl<T>(file: string): T[] {
+  if (!existsSync(file)) return [];
+  return readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map(l => JSON.parse(l));
+}
+
+function writeJsonl<T>(file: string, rows: T[]): void {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, rows.map(r => JSON.stringify(r)).join('\n') + '\n', 'utf8');
+}
+
+// ── Bash safety ─────────────────────────────────────────────────────────────
+
+const SAFE_COMMANDS = [
+  /^cat\b/, /^head\b/, /^tail\b/, /^less\b/, /^more\b/,
+  /^grep\b/, /^rg\b/, /^find\b/, /^fd\b/,
+  /^ls\b/, /^pwd\b/, /^tree\b/, /^which\b/, /^type\b/,
+  /^git\s+(status|log|diff|branch|show|stash\s+list)\b/,
+  /^npm\s+(list|outdated|view)\b/, /^node\s+-e\b/,
+  /^uname\b/, /^whoami\b/, /^date\b/, /^uptime\b/,
+  /^echo\b/, /^printf\b/, /^env\b/, /^printenv\b/,
+  /^--help\b/, /^-h\b/, /^--version\b/, /^man\b/,
+  /^dir\b/, /^type\b/, /^help\b/,
+];
+
+function isSafeCommand(cmd: string): boolean {
+  const trimmed = cmd.trim();
+  return SAFE_COMMANDS.some(re => re.test(trimmed));
+}
+
+function isPlanPath(filePath: string): boolean {
+  return filePath.startsWith(PLANS_ROOT) || filePath.startsWith('.plans\\');
+}
+
+// ── Plugin system prompts ───────────────────────────────────────────────────
+
+function buildPlanModePrompt(tools: string[]): string {
+  return `[PLAN MODE ACTIVE]
+You are in conversational plan mode — a planning dialogue with strict bash restrictions.
+
+Restrictions:
+- Available tools: ${tools.join(', ')}
+- Bash is restricted to read-only commands (ls, grep, git status, etc.) and info commands (--help, -h, --version, man)
+- The write tool is restricted to .plans/ directory only — no codebase file creation or modification
+- Do NOT make code changes during planning.
+
+Your job is to reach shared understanding before formalizing a plan:
+1. Understand the user's intent through dialogue. Push back on weak assumptions, name trade-offs, and ask clarifying questions when needed.
+2. Investigate the codebase with read-only tools. Use questionnaire when explicit choices are needed.
+3. Maintain a living .plans/<plan-name>/context.md as you converge.
+4. Only call submit_plan after the user and agent have converged on the approach.
+
+When you are ready to finalize the plan, call submit_plan with:
+- name: a short kebab-case name (e.g. "add-auth-middleware")
+- title: a human-readable plan title
+- handoff: a markdown document that explains what is changing, why it matters, approach, decisions, file paths, APIs, patterns, constraints, and gotchas
+- tasks: an array of tasks with id (e.g. "t-001"), description (≤60 chars), optional details, and optional depends_on task IDs`;
+}
+
+function buildExecutionPrompt(plan: PlanData, remaining: TaskRecord[]): string | undefined {
+  if (remaining.length === 0) return undefined;
+
+  const taskList = remaining.map(t => {
+    const line = `${t.id}. ${t.description}`;
+    return t.details ? `${line}\n   Details: ${t.details}` : line;
+  }).join('\n\n');
+
+  const current = remaining[0];
+  const currentDetails = current.details ? `\nDetails: ${current.details}` : '';
+
+  return `[EXECUTING PLAN — FOLLOW THE PLAN EXACTLY]
+
+You are executing a structured plan. Your ONLY job is to implement the plan tasks below, one at a time.
+
+Rules:
+- Work on ONE task at a time, starting with ${current.id}
+- After completing each task, IMMEDIATELY call update_task to mark it done with notes
+- Do NOT run diagnostics, linters, test suites, or skills unless a task explicitly asks for it
+- Do NOT explore the codebase beyond what the current task requires
+- Do NOT deviate from the plan — if something seems wrong, call update_task with status "blocked"
+- If you notice worthwhile work OUTSIDE the plan, call add_task to capture it, then keep going
+
+## Current task
+${current.id}: ${current.description}${currentDetails}
+
+## Handoff
+${plan.handoff}
+
+## All remaining tasks
+${taskList}
+
+Start with ${current.id} NOW.`;
+}
+
+// ── Main extension ──────────────────────────────────────────────────────────
+
+export default function piPlan(pi: ExtensionAPI): void {
+  let planModeEnabled = false;
+  let executing = false;
+  let planDir: string | undefined;
+  let plan: PlanData | undefined;
+  let executionStartIdx: number | undefined;
+  let previousModel: { provider: string; id: string } | undefined;
+  let previousThinking: string | undefined;
+
+  const PLAN_TOOLS = ['read', 'bash', 'grep', 'find', 'ls', 'questionnaire', 'submit_plan', 'revise_plan', 'plan_status', 'reconcile_plans'];
+  const EXEC_TOOLS = ['read', 'bash', 'edit', 'write', 'update_task', 'update_tasks', 'add_task', 'plan_status', 'set_active_plan', 'update_plan', 'reconcile_plans'];
+
+  // ── State persistence ──────────────────────────────────────────────────────
+
+  function persistState(): void {
+    pi.appendEntry('pi-plan', { planDir, planEnabled: planModeEnabled, executing, plan, executionStartIdx } as any);
+  }
+
+  function restoreState(ctx: ExtensionContext): void {
+    const entries = ctx.sessionManager.getEntries() as Array<{ type: string; customType?: string; data?: any }>;
+    const saved = entries.filter(e => e.type === 'custom' && e.customType === 'pi-plan').pop();
+    if (saved?.data) {
+      planModeEnabled = saved.data.planEnabled ?? false;
+      executing = saved.data.executing ?? false;
+      planDir = saved.data.planDir;
+      plan = saved.data.plan;
+      executionStartIdx = saved.data.executionStartIdx;
+    }
+    if (pi.getFlag('plan') === true) planModeEnabled = true;
+    if (planModeEnabled) pi.setActiveTools(PLAN_TOOLS);
+  }
+
+  // ── Model switching ────────────────────────────────────────────────────────
+
+  async function switchModel(ctx: ExtensionContext, provider: string, id: string): Promise<boolean> {
+    const model = ctx.modelRegistry.find(provider, id);
+    if (!model) {
+      ctx.ui.notify(`Model ${provider}/${id} not found`, 'error');
+      return false;
+    }
+    const ok = await pi.setModel(model);
+    if (!ok) ctx.ui.notify(`No API key for ${provider}/${id}`, 'error');
+    return ok;
+  }
+
+  // ── File persistence for plans ─────────────────────────────────────────────
+
+  function writePlanFiles(name: string, data: PlanData): void {
+    const dir = planDir(name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'PLAN.md'), `# ${data.title}\n\n${data.handoff}\n`, 'utf8');
+    writeFileSync(join(dir, 'START-PROMPT.md'), buildExecutionPrompt(data, data.tasks) || '', 'utf8');
+    writeJsonl(join(dir, 'tasks.jsonl'), [
+      { _type: 'meta', title: data.title, plan_name: name, created_at: data.tasks[0]?.created_at ?? new Date().toISOString() },
+      ...data.tasks,
+    ]);
+    // Register in global manifest
+    const manifestPath = join(PLANS_ROOT, 'plans.jsonl');
+    const existing = existsSync(manifestPath) ? readJsonl<any>(manifestPath) : [];
+    const existingPlan = existing.find((p: any) => p.name === name);
+    const entry = { name, title: data.title, status: 'in-progress' as PlanStatus, created_at: data.tasks[0]?.created_at ?? new Date().toISOString() };
+    if (existingPlan) Object.assign(existingPlan, entry);
+    else existing.push(entry);
+    writeJsonl(manifestPath, existing);
+  }
+
+  function readPlanFromDisk(dir: string): PlanData | undefined {
+    const tasksPath = join(dir, 'tasks.jsonl');
+    const handoffPath = join(dir, 'PLAN.md');
+    if (!existsSync(tasksPath) || !existsSync(handoffPath)) return undefined;
+    const rows = readJsonl<any>(tasksPath);
+    const meta = rows.find((r: any) => r._type === 'meta');
+    const tasks = rows.filter((r: any) => r._type !== 'meta');
+    const handoff = readFileSync(handoffPath, 'utf8');
+    if (!meta || tasks.length === 0) return undefined;
+    return { title: meta.title, planName: meta.plan_name, handoff, tasks };
+  }
+
+  // ── Phase transitions ──────────────────────────────────────────────────────
+
+  async function enterPlanMode(ctx: ExtensionContext): Promise<void> {
+    planModeEnabled = true;
+    executing = false;
+    planDir = undefined;
+    plan = undefined;
+    previousThinking = pi.getThinkingLevel() as string;
+    previousModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
+    pi.setActiveTools(PLAN_TOOLS);
+    const config = loadConfig();
+    await switchModel(ctx, config.planProvider, config.planModel);
+    pi.setThinkingLevel(config.planThinking as any);
+    ctx.ui.notify(`Plan mode ON — ${config.planProvider}/${config.planModel}:${config.planThinking}`, 'info');
+  }
+
+  async function startExecution(ctx: ExtensionContext): Promise<void> {
+    if (!planDir || !plan) { ctx.ui.notify('No plan to execute.', 'error'); return; }
+    planModeEnabled = false;
+    executing = true;
+    executionStartIdx = ctx.sessionManager.getEntries().length;
+    pi.setActiveTools(EXEC_TOOLS);
+    const config = loadConfig();
+    await switchModel(ctx, config.execProvider, config.execModel);
+    pi.setThinkingLevel(config.execThinking as any);
+    ctx.ui.notify(`Executing — ${config.execProvider}/${config.execModel}:${config.execThinking}`, 'info');
+    persistState();
+  }
+
+  async function exitPlanMode(ctx: ExtensionContext): Promise<void> {
+    planModeEnabled = false;
+    executing = false;
+    executionStartIdx = undefined;
+    pi.setActiveTools(['read', 'bash', 'edit', 'write']);
+    if (previousModel) await switchModel(ctx, previousModel.provider, previousModel.id);
+    if (previousThinking) pi.setThinkingLevel(previousThinking as any);
+    ctx.ui.notify('Plan mode OFF', 'info');
+    persistState();
+  }
+
+  // ── Task update helper ─────────────────────────────────────────────────────
+
+  async function updateTaskInPlan(taskId: string, status: Exclude<TaskStatus, 'pending'>, notes?: string): Promise<void> {
+    if (!plan || !planDir) return;
+    const task = plan.tasks.find(t => t.id === taskId);
+    if (!task) return;
+    task.status = status;
+    task.updated_at = new Date().toISOString();
+    if (notes) task.notes = notes;
+    writeJsonl(join(planDir, 'tasks.jsonl'), [
+      { _type: 'meta', title: plan.title, plan_name: plan.planName, created_at: plan.tasks[0]?.created_at ?? task.updated_at },
+      ...plan.tasks,
+    ]);
+    persistState();
+  }
+
+  // ── Flag ───────────────────────────────────────────────────────────────────
+
+  pi.registerFlag('plan', {
+    description: 'Start in plan mode (read-only + strong model)',
+    type: 'boolean',
+    default: false,
+  });
+
+  // ── Tools ──────────────────────────────────────────────────────────────────
+
+  pi.registerTool({
+    name: 'submit_plan',
+    description: 'Submit a plan with name, title, handoff doc, and tasks. Creates/updates .plans/<name>/ files.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'kebab-case plan name' },
+        title: { type: 'string', description: 'human-readable plan title' },
+        handoff: { type: 'string', description: 'handoff document with full context' },
+        tasks: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              description: { type: 'string', maxLength: 60 },
+              details: { type: 'string' },
+              depends_on: { type: 'array', items: { type: 'string' } },
+            },
+          },
+        },
+      },
+      required: ['name', 'title', 'handoff', 'tasks'],
+    } as any,
+    execute: async (args) => {
+      const now = new Date().toISOString();
+      const data: PlanData = {
+        title: args.title,
+        planName: args.name,
+        handoff: args.handoff,
+        tasks: args.tasks.map((t: any) => ({
+          ...t,
+          status: 'pending' as TaskStatus,
+          origin: 'plan' as const,
+          created_at: now,
+          updated_at: now,
+        })),
+      };
+      writePlanFiles(args.name, data);
+      planDir = planDir(args.name);
+      plan = data;
+      persistState();
+      return `Plan "${args.title}" (${args.name}) saved with ${data.tasks.length} tasks.`;
+    },
+  } as any);
+
+  pi.registerTool({
+    name: 'revise_plan',
+    description: 'Revise an existing plan. Only pass fields that changed (title/handoff/tasks). Tasks with unchanged ids preserve status/notes.',
+    parameters: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Plan name from submit_plan' },
+        title: { type: 'string' },
+        handoff: { type: 'string' },
+        tasks: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              description: { type: 'string', maxLength: 60 },
+              details: { type: 'string' },
+              depends_on: { type: 'array', items: { type: 'string' } },
+            },
+          },
+        },
+      },
+      required: ['name'],
+    } as any,
+    execute: async (args) => {
+      const dir = planDir(args.name);
+      if (!existsSync(dir)) return `No plan "${args.name}" found.`;
+      const existing = readPlanFromDisk(dir);
+      if (!existing) return `Plan "${args.name}" data corrupted.`;
+      const now = new Date().toISOString();
+      if (args.title) existing.title = args.title;
+      if (args.handoff) existing.handoff = args.handoff;
+      if (args.tasks) {
+        const newTasks = args.tasks.map((t: any) => {
+          const old = existing.tasks.find(et => et.id === t.id);
+          return {
+            ...t,
+            status: old?.status || 'pending',
+            notes: old?.notes,
+            origin: 'plan' as const,
+            created_at: old?.created_at || now,
+            updated_at: now,
+          };
+        });
+        existing.tasks = newTasks;
+      }
+      writePlanFiles(args.name, existing);
+      planDir = dir;
+      plan = existing;
+      persistState();
+      return `Plan "${args.name}" revised.`;
+    },
+  } as any);
+
+  pi.registerTool({
+    name: 'update_task',
+    description: 'Mark a task done / skipped / blocked with optional notes.',
+    parameters: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string' },
+        status: { type: 'string', enum: ['done', 'skipped', 'blocked'] },
+        notes: { type: 'string' },
+      },
+      required: ['task_id', 'status'],
+    } as any,
+    execute: async (args) => {
+      if (!plan || !planDir) return 'No active plan.';
+      await updateTaskInPlan(args.task_id, args.status, args.notes);
+      return `Task ${args.task_id} marked ${args.status}.`;
+    },
+  } as any);
+
+  pi.registerTool({
+    name: 'update_tasks',
+    description: 'Mark several tasks done/skipped/blocked in one call (coalesced write).',
+    parameters: {
+      type: 'object',
+      properties: {
+        updates: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              task_id: { type: 'string' },
+              status: { type: 'string', enum: ['done', 'skipped', 'blocked'] },
+              notes: { type: 'string' },
+            },
+            required: ['task_id', 'status'],
+          },
+        },
+      },
+      required: ['updates'],
+    } as any,
+    execute: async (args) => {
+      if (!plan || !planDir) return 'No active plan.';
+      for (const u of args.updates) await updateTaskInPlan(u.task_id, u.status, u.notes);
+      return `${args.updates.length} tasks updated.`;
+    },
+  } as any);
+
+  pi.registerTool({
+    name: 'add_task',
+    description: 'Capture a discovered follow-up task (deferred — not executed now).',
+    parameters: {
+      type: 'object',
+      properties: {
+        description: { type: 'string', maxLength: 60 },
+        reason: { type: 'string', description: 'Why this follow-up matters' },
+        details: { type: 'string' },
+        depends_on: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['description', 'reason'],
+    } as any,
+    execute: async (args) => {
+      if (!plan || !planDir) return 'No active plan.';
+      const now = new Date().toISOString();
+      const taskId = `t-${String(plan.tasks.length + 1).padStart(3, '0')}`;
+      const task: TaskRecord = {
+        id: taskId,
+        description: args.description,
+        details: args.details,
+        status: 'deferred',
+        origin: 'discovered',
+        depends_on: args.depends_on,
+        created_at: now,
+        updated_at: now,
+      };
+      if (args.reason) task.notes = `Reason: ${args.reason}`;
+      plan.tasks.push(task);
+      writeJsonl(join(planDir, 'tasks.jsonl'), [
+        { _type: 'meta', title: plan.title, plan_name: plan.planName, created_at: plan.tasks[0]?.created_at ?? now },
+        ...plan.tasks,
+      ]);
+      persistState();
+      return `Follow-up "${args.description}" captured as ${taskId} (deferred). Review via /plan resume.`;
+    },
+  } as any);
+
+  pi.registerTool({
+    name: 'plan_status',
+    description: 'Read-only snapshot of active plan progress.',
+    parameters: {
+      type: 'object',
+      properties: {
+        plan: { type: 'string', description: 'Plan name (optional)' },
+      },
+    } as any,
+    execute: async (args) => {
+      if (plan) {
+        const done = plan.tasks.filter(t => t.status === 'done').length;
+        const total = plan.tasks.length;
+        return `Plan: ${plan.title} (${plan.planName})\nProgress: ${done}/${total} tasks complete`;
+      }
+      return 'No active plan.';
+    },
+  } as any);
+
+  pi.registerTool({
+    name: 'reconcile_plans',
+    description: 'Detect & repair drift between tasks.jsonl and the registry.',
+    parameters: { type: 'object', properties: {} } as any,
+    execute: async () => {
+      const manifestPath = join(PLANS_ROOT, 'plans.jsonl');
+      if (!existsSync(manifestPath)) return 'No plans directory.';
+      const entries = readJsonl<any>(manifestPath);
+      let report = '';
+      for (const entry of entries) {
+        const dir = planDir(entry.name);
+        if (!existsSync(join(dir, 'tasks.jsonl'))) { report += `\n⚠ ${entry.name}: tasks.jsonl missing`; continue; }
+        const rows = readJsonl<any>(join(dir, 'tasks.jsonl'));
+        const tasks = rows.filter((r: any) => r._type !== 'meta');
+        const allDone = tasks.every((t: any) => t.status === 'done' || t.status === 'skipped');
+        const expectedStatus = allDone ? 'done' : 'in-progress';
+        if (entry.status !== expectedStatus) {
+          entry.status = expectedStatus;
+          report += `\n✓ ${entry.name}: status → ${expectedStatus}`;
+        }
+      }
+      writeJsonl(manifestPath, entries);
+      return report || 'No drift detected.';
+    },
+  } as any);
+
+  // ── Commands ───────────────────────────────────────────────────────────────
+
+  pi.registerCommand('plan', {
+    description: 'Enter plan mode. "/plan resume" picks up an existing plan.',
+    handler: async (args, ctx) => {
+      const trimmed = args?.trim();
+
+      if (trimmed === 'resume') {
+        // Scan .plans/ for in-progress plans
+        if (!existsSync(PLANS_ROOT)) { ctx.ui.notify('No plans directory.', 'info'); return; }
+        const dirs = readdirSync(PLANS_ROOT).filter(d => {
+          try { return existsSync(join(PLANS_ROOT, d, 'tasks.jsonl')) && existsSync(join(PLANS_ROOT, d, 'PLAN.md')); } catch { return false; }
+        });
+        if (dirs.length === 0) { ctx.ui.notify('No saved plans found.', 'info'); return; }
+
+        // Pick one
+        const choice = await ctx.ui.select('Resume plan:', dirs);
+        if (!choice) return;
+        const resumed = readPlanFromDisk(planDir(choice));
+        if (!resumed) { ctx.ui.notify('Plan data corrupted.', 'error'); return; }
+
+        planDir = planDir(choice);
+        plan = resumed;
+        const pending = plan.tasks.filter(t => t.status === 'pending' || t.status === 'deferred');
+
+        if (pending.length === 0 && plan.tasks.every(t => t.status === 'done' || t.status === 'skipped')) {
+          ctx.ui.notify(`Plan "${plan.title}" already complete.`, 'info');
+          return;
+        }
+
+        // Ask: resume execution or re-enter planning
+        const mode = await ctx.ui.select(`Resume "${plan.title}" — ${pending.length} pending tasks`, [
+          'Continue execution',
+          'Re-enter plan mode',
+          'Cancel',
+        ]);
+        if (mode === 'Continue execution') {
+          await startExecution(ctx);
+          if (pending.length > 0) {
+            pi.sendUserMessage(`Resuming plan "${plan.title}". Current task: ${pending[0].id}. ${pending[0].description}`);
+          }
+        } else if (mode === 'Re-enter plan mode') {
+          await enterPlanMode(ctx);
+          pi.sendUserMessage(`Back in plan mode for "${plan.title}". What needs to change?`);
+        }
+        return;
+      }
+
+      // Toggle plan mode
+      if (planModeEnabled || executing) {
+        await exitPlanMode(ctx);
+      } else {
+        await enterPlanMode(ctx);
+        if (trimmed) pi.sendUserMessage(trimmed);
+      }
+    },
+  });
+
+  pi.registerCommand('todos', {
+    description: 'Show current plan progress.',
+    handler: async (_args, ctx) => {
+      if (!plan || plan.tasks.length === 0) { ctx.ui.notify('No plan yet.', 'info'); return; }
+      const icon: Record<string, string> = { pending: '○', done: '✓', skipped: '⊘', blocked: '✗', deferred: '⏸' };
+      const list = plan.tasks.map(t => `${t.id}. ${icon[t.status] || '○'} ${t.description}${t.origin === 'discovered' ? ' (discovered)' : ''}`).join('\n');
+      ctx.ui.notify(`Plan Progress — ${plan.title}:\n${list}`, 'info');
+    },
+  });
+
+  pi.registerCommand('plan-config', {
+    description: 'Configure plan/exec models.',
+    handler: async (_args, ctx) => {
+      const cfg = loadConfig();
+      // Simple sequential config: just use ctx.ui.input for each field
+      const providers = ['anthropic', 'openai', 'google', 'deepseek'];
+      const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+
+      const pProvider = await ctx.ui.select('Planning model provider:', providers.map(p => `${p}${p === cfg.planProvider ? ' (current)' : ''}`));
+      if (!pProvider) return;
+      cfg.planProvider = pProvider.replace(/\s*\(current\)$/, '');
+
+      const pModel = await ctx.ui.input('Planning model ID:', cfg.planModel);
+      if (!pModel) return;
+      cfg.planModel = pModel.trim();
+
+      const pThinking = await ctx.ui.select('Planning thinking level:', thinkingLevels.map(t => `${t}${t === cfg.planThinking ? ' (current)' : ''}`));
+      if (!pThinking) return;
+      cfg.planThinking = pThinking.replace(/\s*\(current\)$/, '');
+
+      const eProvider = await ctx.ui.select('Execution model provider:', providers.map(p => `${p}${p === cfg.execProvider ? ' (current)' : ''}`));
+      if (!eProvider) return;
+      cfg.execProvider = eProvider.replace(/\s*\(current\)$/, '');
+
+      const eModel = await ctx.ui.input('Execution model ID:', cfg.execModel);
+      if (!eModel) return;
+      cfg.execModel = eModel.trim();
+
+      const eThinking = await ctx.ui.select('Execution thinking level:', thinkingLevels.map(t => `${t}${t === cfg.execThinking ? ' (current)' : ''}`));
+      if (!eThinking) return;
+      cfg.execThinking = eThinking.replace(/\s*\(current\)$/, '');
+
+      saveConfig(cfg);
+      ctx.ui.notify(`Plan config saved: plan=${cfg.planProvider}/${cfg.planModel} exec=${cfg.execProvider}/${cfg.execModel}`, 'info');
+    },
+  });
+
+  pi.registerShortcut(Key.ctrlAlt('p'), {
+    description: 'Toggle plan mode',
+    handler: async (ctx) => {
+      if (planModeEnabled || executing) await exitPlanMode(ctx);
+      else await enterPlanMode(ctx);
+    },
+  });
+
+  // ── Event: block destructive bash + restrict writes ────────────────────────
+
+  pi.on('tool_call', async (event) => {
+    if (!planModeEnabled) return;
+    if (event.toolName === 'bash') {
+      const cmd = event.input.command as string;
+      if (!isSafeCommand(cmd)) {
+        return { block: true, reason: `Plan mode: command blocked. Use /plan to exit plan mode first.\nCommand: ${cmd}` };
+      }
+    }
+    if (event.toolName === 'write' || event.toolName === 'edit') {
+      const p = event.input.path as string;
+      if (!isPlanPath(p)) {
+        return { block: true, reason: `Plan mode: writes restricted to .plans/ directory.\nPath: ${p}` };
+      }
+    }
+  });
+
+  // ── Event: inject phase prompts ────────────────────────────────────────────
+
+  pi.on('before_agent_start', async () => {
+    if (planModeEnabled) {
+      return { message: { customType: 'pi-plan-context', content: buildPlanModePrompt(PLAN_TOOLS), display: false } };
+    }
+    if (executing && plan) {
+      const remaining = plan.tasks.filter(t => t.status === 'pending' || t.status === 'deferred');
+      const content = buildExecutionPrompt(plan, remaining);
+      if (content) return { message: { customType: 'pi-plan-execution-context', content, display: false } };
+    }
+  });
+
+  // ── Event: agent_end — plan confirmation, blocked tasks, completion ────────
+
+  pi.on('agent_end', async (_event, ctx) => {
+    if (!ctx.hasUI) return;
+
+    // ── Execution phase: blocked task handling ──
+    if (executing && plan) {
+      const blocked = plan.tasks.filter(t => t.status === 'blocked');
+      if (blocked.length > 0) {
+        const bs = blocked[0];
+        let info = bs.notes ? `Task ${bs.id}: ${bs.description}\nReason: ${bs.notes}` : `Task ${bs.id}: ${bs.description}`;
+        const deferredCount = plan.tasks.filter(t => t.status === 'deferred').length;
+        if (deferredCount > 0) info += `\n\nNote: ${deferredCount} follow-up(s) captured.`;
+
+        const choice = await ctx.ui.select(`Task blocked — ${info}\n\nWhat next?`, [
+          'Skip this task',
+          'Provide instructions',
+          'Re-plan',
+          'Abort execution',
+        ]);
+
+        if (choice === 'Skip this task') {
+          await updateTaskInPlan(bs.id, 'skipped');
+          const next = plan.tasks.filter(t => t.status === 'pending');
+          if (next.length > 0) {
+            pi.sendUserMessage(`Skipped ${bs.id}. Continue with ${next[0].id}: ${next[0].description}`, { deliverAs: 'followUp' });
+          }
+        } else if (choice === 'Provide instructions') {
+          const instructions = await ctx.ui.editor('Instructions for the blocked task:', '');
+          if (instructions?.trim()) {
+            await updateTaskInPlan(bs.id, 'pending');
+            pi.sendUserMessage(`Retry ${bs.id} with: ${instructions.trim()}`, { deliverAs: 'followUp' });
+          }
+        } else if (choice === 'Re-plan') {
+          await enterPlanMode(ctx);
+          pi.sendUserMessage(`Task ${bs.id} blocked: ${bs.notes || 'no details'}. Re-analyze and revise.`, { deliverAs: 'followUp' });
+        } else if (choice === 'Abort execution') {
+          await exitPlanMode(ctx);
+        }
+        persistState();
+        return;
+      }
+
+      // ── Execution phase: completion check ──
+      const pending = plan.tasks.filter(t => t.status === 'pending' || t.status === 'deferred');
+      if (pending.length === 0) {
+        const choice = await ctx.ui.select(`Plan "${plan.title}" complete! ✓`, [
+          'Exit plan mode',
+          'Stay in execution mode',
+        ]);
+        if (choice === 'Exit plan mode') await exitPlanMode(ctx);
+        return;
+      }
+    }
+
+    // ── Plan phase: extract todos and show confirmation ──
+    if (planModeEnabled && plan && plan.tasks.length > 0) {
+      const choice = await ctx.ui.select('Plan ready — what next?', [
+        'Execute the plan',
+        'Stay in plan mode',
+        'Refine the plan',
+      ]);
+
+      if (choice === 'Execute the plan') {
+        await startExecution(ctx);
+        const first = plan.tasks.find(t => t.status === 'pending');
+        if (first) pi.sendUserMessage(`Execute plan "${plan.title}". Start with ${first.id}: ${first.description}`, { deliverAs: 'followUp' });
+      } else if (choice === 'Refine the plan') {
+        const refinement = await ctx.ui.editor('Refine the plan:', '');
+        if (refinement?.trim()) pi.sendUserMessage(refinement.trim());
+      }
+    }
+  });
+
+  // ── Event: session_start — restore state ───────────────────────────────────
+
+  pi.on('session_start', async (_event, ctx) => {
+    restoreState(ctx);
+    if (planModeEnabled && !plan && existsSync(PLANS_ROOT)) {
+      // Auto-attach plan if one exists on disk
+      const dirs = readdirSync(PLANS_ROOT).filter(d => {
+        try { return existsSync(join(PLANS_ROOT, d, 'tasks.jsonl')); } catch { return false; }
+      });
+      for (const d of dirs) {
+        const p = readPlanFromDisk(planDir(d));
+        if (p && p.tasks.some(t => t.status === 'in-progress' || t.status === 'pending')) {
+          planDir = planDir(d);
+          plan = p;
+          break;
+        }
+      }
+    }
+  });
+
+  // ── Event: session_shutdown — cleanup ──────────────────────────────────────
+
+  pi.on('session_shutdown', () => {
+    // no-op: state persists on disk
+  });
+}
