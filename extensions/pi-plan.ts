@@ -633,39 +633,44 @@ export default function piPlan(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand('plan-config', {
-    description: 'Configure plan/exec models.',
+    description: 'Configure plan/exec models (picks from your configured providers).',
     handler: async (_args, ctx) => {
       const cfg = loadConfig();
-      // Simple sequential config: just use ctx.ui.input for each field
-      const providers = ['anthropic', 'openai', 'google', 'deepseek'];
-      const thinkingLevels = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+      const allModels = ctx.modelRegistry?.getAll() || [];
+      if (allModels.length === 0) { ctx.ui.notify('No models configured. Use /login first.', 'error'); return; }
 
-      const pProvider = await ctx.ui.select('Planning model provider:', providers.map(p => `${p}${p === cfg.planProvider ? ' (current)' : ''}`));
-      if (!pProvider) return;
-      cfg.planProvider = pProvider.replace(/\s*\(current\)$/, '');
+      // Group by provider
+      const byProvider = new Map<string, string[]>();
+      for (const m of allModels) {
+        const list = byProvider.get(m.provider) || [];
+        list.push(m.id);
+        byProvider.set(m.provider, list);
+      }
+      const providers = [...byProvider.keys()];
 
-      const pModel = await ctx.ui.input('Planning model ID:', cfg.planModel);
-      if (!pModel) return;
-      cfg.planModel = pModel.trim();
+      // Helper: pick model for a role
+      async function pickModel(role: string, currentP: string, currentM: string): Promise<{ provider: string; model: string } | undefined> {
+        const provLabel = await ctx.ui.select(`${role} — provider:`, providers.map(p => `${p}${p === currentP ? ' (current)' : ''}`));
+        if (!provLabel) return undefined;
+        const prov = provLabel.replace(/\s*\(current\)$/, '');
+        const models = byProvider.get(prov) || [];
+        const modelLabel = await ctx.ui.select(`${role} — model (${prov}):`, models.map(m => `${m}${m === currentM && prov === currentP ? ' (current)' : ''}`));
+        if (!modelLabel) return undefined;
+        return { provider: prov, model: modelLabel.replace(/\s*\(current\)$/, '') };
+      }
 
-      const pThinking = await ctx.ui.select('Planning thinking level:', thinkingLevels.map(t => `${t}${t === cfg.planThinking ? ' (current)' : ''}`));
-      if (!pThinking) return;
-      cfg.planThinking = pThinking.replace(/\s*\(current\)$/, '');
+      const plan = await pickModel('Planning (strong)', cfg.planProvider, cfg.planModel);
+      if (!plan) return;
+      cfg.planProvider = plan.provider;
+      cfg.planModel = plan.model;
 
-      const eProvider = await ctx.ui.select('Execution model provider:', providers.map(p => `${p}${p === cfg.execProvider ? ' (current)' : ''}`));
-      if (!eProvider) return;
-      cfg.execProvider = eProvider.replace(/\s*\(current\)$/, '');
-
-      const eModel = await ctx.ui.input('Execution model ID:', cfg.execModel);
-      if (!eModel) return;
-      cfg.execModel = eModel.trim();
-
-      const eThinking = await ctx.ui.select('Execution thinking level:', thinkingLevels.map(t => `${t}${t === cfg.execThinking ? ' (current)' : ''}`));
-      if (!eThinking) return;
-      cfg.execThinking = eThinking.replace(/\s*\(current\)$/, '');
+      const exec = await pickModel('Execution (light)', cfg.execProvider, cfg.execModel);
+      if (!exec) return;
+      cfg.execProvider = exec.provider;
+      cfg.execModel = exec.model;
 
       saveConfig(cfg);
-      ctx.ui.notify(`Plan config saved: plan=${cfg.planProvider}/${cfg.planModel} exec=${cfg.execProvider}/${cfg.execModel}`, 'info');
+      ctx.ui.notify(`Plan config saved: plan=${cfg.planProvider}/${cfg.planModel}  exec=${cfg.execProvider}/${cfg.execModel}`, 'info');
     },
   });
 
