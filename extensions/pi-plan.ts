@@ -193,7 +193,7 @@ Start with ${current.id} NOW.`;
 export default function piPlan(pi: ExtensionAPI): void {
   let planModeEnabled = false;
   let executing = false;
-  let planDir: string | undefined;
+  let activePlanDir: string | undefined;
   let plan: PlanData | undefined;
   let executionStartIdx: number | undefined;
   let previousModel: { provider: string; id: string } | undefined;
@@ -205,7 +205,7 @@ export default function piPlan(pi: ExtensionAPI): void {
   // ── State persistence ──────────────────────────────────────────────────────
 
   function persistState(): void {
-    pi.appendEntry('pi-plan', { planDir, planEnabled: planModeEnabled, executing, plan, executionStartIdx } as any);
+    pi.appendEntry('pi-plan', { planDir: activePlanDir, planEnabled: planModeEnabled, executing, plan, executionStartIdx } as any);
   }
 
   function restoreState(ctx: ExtensionContext): void {
@@ -214,7 +214,7 @@ export default function piPlan(pi: ExtensionAPI): void {
     if (saved?.data) {
       planModeEnabled = saved.data.planEnabled ?? false;
       executing = saved.data.executing ?? false;
-      planDir = saved.data.planDir;
+      activePlanDir = saved.data.planDir;
       plan = saved.data.plan;
       executionStartIdx = saved.data.executionStartIdx;
     }
@@ -288,7 +288,7 @@ export default function piPlan(pi: ExtensionAPI): void {
   async function enterPlanMode(ctx: ExtensionContext): Promise<void> {
     planModeEnabled = true;
     executing = false;
-    planDir = undefined;
+    activePlanDir = undefined;
     plan = undefined;
     previousThinking = pi.getThinkingLevel() as string;
     previousModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
@@ -306,7 +306,7 @@ export default function piPlan(pi: ExtensionAPI): void {
   }
 
   async function startExecution(ctx: ExtensionContext): Promise<void> {
-    if (!planDir || !plan) { ctx.ui.notify('No plan to execute.', 'error'); return; }
+    if (!activePlanDir || !plan) { ctx.ui.notify('No plan to execute.', 'error'); return; }
     planModeEnabled = false;
     executing = true;
     executionStartIdx = ctx.sessionManager.getEntries().length;
@@ -339,13 +339,13 @@ export default function piPlan(pi: ExtensionAPI): void {
   // ── Task update helper ─────────────────────────────────────────────────────
 
   async function updateTaskInPlan(taskId: string, status: Exclude<TaskStatus, 'pending'>, notes?: string): Promise<void> {
-    if (!plan || !planDir) return;
+    if (!plan || !activePlanDir) return;
     const task = plan.tasks.find(t => t.id === taskId);
     if (!task) return;
     task.status = status;
     task.updated_at = new Date().toISOString();
     if (notes) task.notes = notes;
-    writeJsonl(join(planDir, 'tasks.jsonl'), [
+    writeJsonl(join(activePlanDir, 'tasks.jsonl'), [
       { _type: 'meta', title: plan.title, plan_name: plan.planName, created_at: plan.tasks[0]?.created_at ?? task.updated_at },
       ...plan.tasks,
     ]);
@@ -403,7 +403,7 @@ export default function piPlan(pi: ExtensionAPI): void {
         })),
       };
       writePlanFiles(args.name, data);
-      planDir = planDir(args.name);
+      activePlanDir = planDir(args.name);
       plan = data;
       persistState();
       return `Plan "${args.title}" (${args.name}) saved with ${data.tasks.length} tasks.`;
@@ -456,7 +456,7 @@ export default function piPlan(pi: ExtensionAPI): void {
         existing.tasks = newTasks;
       }
       writePlanFiles(args.name, existing);
-      planDir = dir;
+      activePlanDir = dir;
       plan = existing;
       persistState();
       return `Plan "${args.name}" revised.`;
@@ -476,7 +476,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       required: ['task_id', 'status'],
     } as any,
     execute: async (_id, args) => {
-      if (!plan || !planDir) return 'No active plan.';
+      if (!plan || !activePlanDir) return 'No active plan.';
       await updateTaskInPlan(args.task_id, args.status, args.notes);
       return `Task ${args.task_id} marked ${args.status}.`;
     },
@@ -504,7 +504,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       required: ['updates'],
     } as any,
     execute: async (_id, args) => {
-      if (!plan || !planDir) return 'No active plan.';
+      if (!plan || !activePlanDir) return 'No active plan.';
       for (const u of args.updates) await updateTaskInPlan(u.task_id, u.status, u.notes);
       return `${args.updates.length} tasks updated.`;
     },
@@ -524,7 +524,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       required: ['description', 'reason'],
     } as any,
     execute: async (_id, args) => {
-      if (!plan || !planDir) return 'No active plan.';
+      if (!plan || !activePlanDir) return 'No active plan.';
       const now = new Date().toISOString();
       const taskId = `t-${String(plan.tasks.length + 1).padStart(3, '0')}`;
       const task: TaskRecord = {
@@ -539,7 +539,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       };
       if (args.reason) task.notes = `Reason: ${args.reason}`;
       plan.tasks.push(task);
-      writeJsonl(join(planDir, 'tasks.jsonl'), [
+      writeJsonl(join(activePlanDir, 'tasks.jsonl'), [
         { _type: 'meta', title: plan.title, plan_name: plan.planName, created_at: plan.tasks[0]?.created_at ?? now },
         ...plan.tasks,
       ]);
@@ -614,7 +614,7 @@ export default function piPlan(pi: ExtensionAPI): void {
         const resumed = readPlanFromDisk(planDir(choice));
         if (!resumed) { ctx.ui.notify('Plan data corrupted.', 'error'); return; }
 
-        planDir = planDir(choice);
+        activePlanDir = planDir(choice);
         plan = resumed;
         const pending = plan.tasks.filter(t => t.status === 'pending' || t.status === 'deferred');
 
@@ -828,7 +828,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       for (const d of dirs) {
         const p = readPlanFromDisk(planDir(d));
         if (p && p.tasks.some(t => t.status === 'in-progress' || t.status === 'pending')) {
-          planDir = planDir(d);
+          activePlanDir = planDir(d);
           plan = p;
           break;
         }
