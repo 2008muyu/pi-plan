@@ -1,6 +1,6 @@
 {
   "name": "@2008muyu/pi-plan",
-  "version": "1.1.0",
+  "version": "1.1.2",
   "description": "Configurable two-phase planning workflow for pi — plan with a strong model, execute with a light model",
   "keywords": [
     "pi-package",
@@ -28,6 +28,6 @@
     "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
-    "@2008muyu/pi-ui-prompt-dialog": "^0.1.0"
+    "@2008muyu/pi-ui-prompt-dialog": "^0.1.2"
   }
 }

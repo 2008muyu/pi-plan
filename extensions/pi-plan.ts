@@ -768,6 +768,15 @@ function writePlanFiles(name: string, data: PlanData): void {
 
       saveConfig(cfg);
       ctx.ui.notify(`Plan config saved: plan=${cfg.planProvider}/${cfg.planModel}  exec=${cfg.execProvider}/${cfg.execModel}`, 'info');
+
+      // Immediately apply if already in plan/exec mode
+      if (planModeEnabled) {
+        const switched = await switchModel(ctx, cfg.planProvider, cfg.planModel, 'Plan');
+        if (switched) pi.setThinkingLevel(cfg.planThinking as any);
+      } else if (executing) {
+        const switched = await switchModel(ctx, cfg.execProvider, cfg.execModel, 'Exec');
+        if (switched) pi.setThinkingLevel(cfg.execThinking as any);
+      }
     },
   });
 
