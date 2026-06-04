@@ -224,14 +224,29 @@ export default function piPlan(pi: ExtensionAPI): void {
 
   // ── Model switching ────────────────────────────────────────────────────────
 
-  async function switchModel(ctx: ExtensionContext, provider: string, id: string): Promise<boolean> {
+  async function switchModel(ctx: ExtensionContext, provider: string, id: string, role: string): Promise<boolean> {
     const model = ctx.modelRegistry.find(provider, id);
     if (!model) {
-      ctx.ui.notify(`Model ${provider}/${id} not found`, 'error');
+      ctx.ui.notify(`[pi-plan] ${role} model ${provider}/${id} not found. Run /plan-config.`, 'error');
       return false;
     }
+
+    // Check if current context fits target model's context window
+    const usage = ctx.getContextUsage?.();
+    if (usage && usage.tokens !== null && model.contextWindow && usage.tokens > model.contextWindow) {
+      ctx.ui.notify(`[pi-plan] Context (${usage.tokens}) exceeds ${id}'s window (${model.contextWindow}). Compacting...`, 'warning');
+      const choice = await ctx.ui.select('Context too large — compact first?', [
+        'Compact and continue',
+        'Cancel',
+      ]);
+      if (choice !== 'Compact and continue') return false;
+      await new Promise<void>((resolve, reject) => {
+        ctx.compact({ onComplete: () => resolve(), onError: () => reject() });
+      });
+    }
+
     const ok = await pi.setModel(model);
-    if (!ok) ctx.ui.notify(`No API key for ${provider}/${id}`, 'error');
+    if (!ok) ctx.ui.notify(`[pi-plan] No API key for ${provider}/${id}. Run /login.`, 'error');
     return ok;
   }
 
@@ -279,7 +294,13 @@ export default function piPlan(pi: ExtensionAPI): void {
     previousModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
     pi.setActiveTools(PLAN_TOOLS);
     const config = loadConfig();
-    await switchModel(ctx, config.planProvider, config.planModel);
+    const switched = await switchModel(ctx, config.planProvider, config.planModel, 'Plan');
+    if (!switched) {
+      planModeEnabled = false;
+      pi.setActiveTools(['read', 'bash', 'edit', 'write']);
+      ctx.ui.notify('[pi-plan] Could not enter plan mode.', 'error');
+      return;
+    }
     pi.setThinkingLevel(config.planThinking as any);
     ctx.ui.notify(`Plan mode ON — ${config.planProvider}/${config.planModel}:${config.planThinking}`, 'info');
   }
@@ -291,7 +312,14 @@ export default function piPlan(pi: ExtensionAPI): void {
     executionStartIdx = ctx.sessionManager.getEntries().length;
     pi.setActiveTools(EXEC_TOOLS);
     const config = loadConfig();
-    await switchModel(ctx, config.execProvider, config.execModel);
+    const switched = await switchModel(ctx, config.execProvider, config.execModel, 'Exec');
+    if (!switched) {
+      executing = false;
+      planModeEnabled = true;
+      pi.setActiveTools(PLAN_TOOLS);
+      ctx.ui.notify('[pi-plan] Could not start execution.', 'error');
+      return;
+    }
     pi.setThinkingLevel(config.execThinking as any);
     ctx.ui.notify(`Executing — ${config.execProvider}/${config.execModel}:${config.execThinking}`, 'info');
     persistState();
@@ -302,7 +330,7 @@ export default function piPlan(pi: ExtensionAPI): void {
     executing = false;
     executionStartIdx = undefined;
     pi.setActiveTools(['read', 'bash', 'edit', 'write']);
-    if (previousModel) await switchModel(ctx, previousModel.provider, previousModel.id);
+    if (previousModel) await switchModel(ctx, previousModel.provider, previousModel.id, 'Restore');
     if (previousThinking) pi.setThinkingLevel(previousThinking as any);
     ctx.ui.notify('Plan mode OFF', 'info');
     persistState();
