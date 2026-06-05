@@ -131,9 +131,17 @@ function isSafeCommand(cmd: string): boolean {
   return SAFE_COMMANDS.some(re => re.test(trimmed));
 }
 
-/** Check for shell output redirection operators (>, >>, 2>, &>, >|, >&) */
+/** Check for shell output redirection that writes to a real file.
+ *  Safe patterns like 2>/dev/null, 2>&1, >/dev/null are excluded. */
 function hasOutputRedirect(cmd: string): boolean {
-  return /(?:^|\s|[0-9&])>/.test(cmd);
+  // Strip safe redirect patterns (discard to /dev/null, fd merging)
+  const stripped = cmd
+    .replace(/\d*>\s*\/dev\/null/g, '')   // >/dev/null, 2>/dev/null
+    .replace(/\d*>>\s*\/dev\/null/g, '')  // >>/dev/null, 2>>/dev/null
+    .replace(/\d*>&\d/g, '')              // 2>&1, 1>&2
+    .replace(/&>\s*\/dev\/null/g, '');    // &>/dev/null
+  // If any > remains, it's writing to a real file
+  return /(?:^|\s|[0-9&])>/.test(stripped);
 }
 
 function isPlanPath(filePath: string): boolean {
@@ -397,6 +405,10 @@ function writePlanFiles(name: string, data: PlanData): void {
     ctx.ui.notify('Plan mode OFF', 'info');
     persistState();
     updatePlanIndicator(ctx);
+    // Inject a follow-up message to trigger a new turn.
+    // New turn's before_agent_start won't inject plan prompt
+    // because planModeEnabled is now false.
+    pi.sendUserMessage('[SYSTEM] Plan mode exited. Normal operation resumed.', { deliverAs: 'followUp' });
   }
 
   // ── Task update helper ─────────────────────────────────────────────────────
@@ -812,9 +824,10 @@ function writePlanFiles(name: string, data: PlanData): void {
 
     if (choice === '退出并执行') {
       await exitPlanMode(ctx);
-      // Block this call but tell LLM plan mode is off, so it retries
-      // with full access on the next turn.
-      return { block: true, reason: 'Plan mode exited. Full read/write/bash access restored. Please retry the operation.' };
+      // Allow the tool call (the block was a false positive or user wants to
+      // execute it anyway). exitPlanMode already injected a follow-up message
+      // that triggers a new clean turn.
+      return undefined;
     }
 
     // Cancel / Escape / fallthrough
