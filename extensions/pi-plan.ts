@@ -133,7 +133,7 @@ function isSafeCommand(cmd: string): boolean {
 
 /** Check for shell output redirection operators (>, >>, 2>, &>, >|, >&) */
 function hasOutputRedirect(cmd: string): boolean {
-  return /(?:^|\s|[0-9&])>(?:>|&|\||\s|$)/.test(cmd);
+  return /(?:^|\s|[0-9&])>/.test(cmd);
 }
 
 function isPlanPath(filePath: string): boolean {
@@ -401,7 +401,7 @@ function writePlanFiles(name: string, data: PlanData): void {
 
   // ── Task update helper ─────────────────────────────────────────────────────
 
-  async function updateTaskInPlan(taskId: string, status: Exclude<TaskStatus, 'pending'>, notes?: string): Promise<void> {
+  async function updateTaskInPlan(taskId: string, status: TaskStatus, notes?: string): Promise<void> {
     if (!plan || !activePlanDir) return;
     const task = plan.tasks.find(t => t.id === taskId);
     if (!task) return;
@@ -943,7 +943,7 @@ function writePlanFiles(name: string, data: PlanData): void {
       });
       for (const d of dirs) {
         const p = readPlanFromDisk(planDir(d));
-        if (p && p.tasks.some(t => t.status === 'in-progress' || t.status === 'pending')) {
+        if (p && p.tasks.some(t => t.status === 'blocked' || t.status === 'pending')) {
           activePlanDir = planDir(d);
           plan = p;
           break;
