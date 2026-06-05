@@ -117,6 +117,13 @@ const SAFE_COMMANDS = [
   /^echo\b/, /^printf\b/, /^env\b/, /^printenv\b/,
   /^--help\b/, /^-h\b/, /^--version\b/, /^man\b/,
   /^dir\b/, /^type\b/, /^help\b/,
+  // Read-only POSIX utilities
+  /^sed\b/, /^awk\b/, /^sort\b/, /^uniq\b/,
+  /^wc\b/, /^cut\b/, /^tr\b/, /^file\b/,
+  /^stat\b/, /^du\b/, /^df\b/, /^diff\b/,
+  /^comm\b/, /^paste\b/, /^column\b/, /^xargs\b/,
+  /^basename\b/, /^dirname\b/, /^realpath\b/, /^readlink\b/,
+  /^fmt\b/, /^nl\b/, /^od\b/, /^fold\b/,
 ];
 
 function isSafeCommand(cmd: string): boolean {
@@ -800,10 +807,9 @@ function writePlanFiles(name: string, data: PlanData): void {
 
     if (choice === '退出并执行') {
       await exitPlanMode(ctx);
-      // Returning undefined = allow the tool call. After exitPlanMode both
-      // planModeEnabled and executing are false, so this handler won't
-      // fire again for callbacks triggered during the same turn.
-      return undefined;
+      // Block this call but tell LLM plan mode is off, so it retries
+      // with full access on the next turn.
+      return { block: true, reason: 'Plan mode exited. Full read/write/bash access restored. Please retry the operation.' };
     }
 
     // Cancel / Escape / fallthrough
