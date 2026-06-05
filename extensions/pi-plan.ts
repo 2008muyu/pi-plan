@@ -131,6 +131,11 @@ function isSafeCommand(cmd: string): boolean {
   return SAFE_COMMANDS.some(re => re.test(trimmed));
 }
 
+/** Check for shell output redirection operators (>, >>, 2>, &>, >|, >&) */
+function hasOutputRedirect(cmd: string): boolean {
+  return /(?:^|\s|[0-9&])>(?:>|&|\||\s|$)/.test(cmd);
+}
+
 function isPlanPath(filePath: string): boolean {
   return filePath.startsWith(PLANS_ROOT) || filePath.startsWith('.plans\\');
 }
@@ -823,7 +828,7 @@ function writePlanFiles(name: string, data: PlanData): void {
 
     if (event.toolName === 'bash') {
       const cmd = event.input.command as string;
-      if (!isSafeCommand(cmd)) {
+      if (!isSafeCommand(cmd) || hasOutputRedirect(cmd)) {
         originalReason = `Plan mode: command blocked. Use /plan to exit plan mode first.\nCommand: ${cmd}`;
       }
     }

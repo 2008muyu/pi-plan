@@ -1,6 +1,6 @@
 {
   "name": "@2008muyu/pi-plan",
-  "version": "1.1.4",
+  "version": "1.1.5",
   "description": "Configurable two-phase planning workflow for pi — plan with a strong model, execute with a light model",
   "keywords": [
     "pi-package",
