@@ -124,6 +124,8 @@ const SAFE_COMMANDS = [
   /^comm\b/, /^paste\b/, /^column\b/, /^xargs\b/,
   /^basename\b/, /^dirname\b/, /^realpath\b/, /^readlink\b/,
   /^fmt\b/, /^nl\b/, /^od\b/, /^fold\b/,
+  // Read-only npm/CLI tools
+  /^defuddle\b/,
 ];
 
 function isSafeCommand(cmd: string): boolean {
