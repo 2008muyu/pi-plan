@@ -55,6 +55,7 @@ interface PlanConfig {
   execProvider: string;
   execModel: string;
   execThinking: string;
+  bashSafetyMode: 'blacklist' | 'allowlist';
 }
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -68,6 +69,7 @@ const DEFAULT_CONFIG: PlanConfig = {
   execProvider: 'openai',
   execModel: 'gpt-5.5',
   execThinking: 'low',
+  bashSafetyMode: 'blacklist',
 };
 
 function loadConfig(): PlanConfig {
@@ -81,6 +83,7 @@ function loadConfig(): PlanConfig {
     execProvider: process.env.PI_EXEC_PROVIDER || DEFAULT_CONFIG.execProvider,
     execModel: process.env.PI_EXEC_MODEL || DEFAULT_CONFIG.execModel,
     execThinking: process.env.PI_EXEC_THINKING || DEFAULT_CONFIG.execThinking,
+    bashSafetyMode: (process.env.PI_PLAN_BASH_SAFETY_MODE as any) || DEFAULT_CONFIG.bashSafetyMode,
   };
 }
 
@@ -128,9 +131,31 @@ const SAFE_COMMANDS = [
   /^defuddle\b/,
 ];
 
+/** Commands that write to disk — blocked in blacklist mode */
+const UNSAFE_COMMANDS = [
+  /^rm\b/, /^rmdir\b/, /^mv\b/, /^cp\b/,
+  /^dd\b/, /^chmod\b/, /^chown\b/, /^chattr\b/, /^ln\b/,
+  /^npm\s+(install|ci|add|uninstall)\b/, /^yarn\s+(add|remove|install)\b/,
+  /^pnpm\s+(add|remove|install)\b/, /^bun\s+(add|remove|install)\b/,
+  /^pip\b/, /^pip3\b/, /^gem\s+install\b/, /^cargo\s+install\b/,
+  /^tee\b/, /^truncate\b/, /^mkfs\b/, /^fdisk\b/,
+  /^wget\s+-[^O]*[Oo]/, /^curl\s+-[^\s]*[Oo]\b/,
+];
+
+function getBashSafetyMode(): 'blacklist' | 'allowlist' {
+  return loadConfig().bashSafetyMode;
+}
+
+/** Check if a bash command is safe in plan mode */
 function isSafeCommand(cmd: string): boolean {
   const trimmed = cmd.trim();
-  return SAFE_COMMANDS.some(re => re.test(trimmed));
+  if (!trimmed) return true;
+  const mode = getBashSafetyMode();
+  if (mode === 'allowlist') {
+    return SAFE_COMMANDS.some(re => re.test(trimmed));
+  }
+  // Blacklist mode: allow unless explicitly unsafe
+  return !UNSAFE_COMMANDS.some(re => re.test(trimmed));
 }
 
 /** Check for shell output redirection that writes to a real file.
@@ -805,6 +830,24 @@ function writePlanFiles(name: string, data: PlanData): void {
     },
   });
 
+  pi.registerCommand('plan-safe-mode', {
+    description: 'Set bash safety mode: blacklist (default) or allowlist. /plan-safe-mode to toggle, /plan-safe-mode [blacklist|allowlist] to set explicitly.',
+    handler: async (args, ctx) => {
+      const cfg = loadConfig();
+      const current = cfg.bashSafetyMode;
+      if (!args?.trim()) {
+        cfg.bashSafetyMode = current === 'blacklist' ? 'allowlist' : 'blacklist';
+      } else if (args.trim() === 'blacklist' || args.trim() === 'allowlist') {
+        cfg.bashSafetyMode = args.trim() as any;
+      } else {
+        ctx.ui.notify(`Usage: /plan-safe-mode [blacklist|allowlist]. Current: ${current}`, 'info');
+        return;
+      }
+      saveConfig(cfg);
+      ctx.ui.notify(`Bash safety mode → ${cfg.bashSafetyMode}`, 'info');
+    },
+  });
+
   pi.registerShortcut(Key.ctrlAlt('p'), {
     description: 'Toggle plan mode',
     handler: async (ctx) => {
@@ -844,7 +887,8 @@ function writePlanFiles(name: string, data: PlanData): void {
     if (event.toolName === 'bash') {
       const cmd = event.input.command as string;
       if (!isSafeCommand(cmd) || hasOutputRedirect(cmd)) {
-        originalReason = `Plan mode: command blocked. Use /plan to exit plan mode first.\nCommand: ${cmd}`;
+        originalReason = `Plan mode (${getBashSafetyMode()}): command blocked. Use /plan to exit, /plan-safe-mode to switch.
+Command: ${cmd}`;
       }
     }
     if ((event.toolName === 'write' || event.toolName === 'edit') && !originalReason) {
