@@ -12,7 +12,7 @@ Existing plan-mode extensions hardcode model settings. `@2008muyu/pi-plan` lets 
 - **Planning model** — strong reasoning (e.g. `claude-opus-4-6`, `gemini-3-pro`, `deepseek-r1`)
 - **Execution model** — lightweight for saving tokens (e.g. `gpt-5.5`, `claude-sonnet-4`)
 
-Configure once via `/plan-config`, then just `/plan` and go.
+Configure once via `/plan-settings`, then just `/plan` and go.
 
 ## Install
 
@@ -50,11 +50,37 @@ When the plan is done, you get a menu:
 
 Lists all in-progress plans from disk. Pick one to continue execution or re-enter planning.
 
-### `/plan-config` — Configure models
+### `/plan list` — Show all plans
 
-Opens interactive prompts for:
-- Planning model provider + ID + thinking level
-- Execution model provider + ID + thinking level
+```bash
+/plan list   # or /plan ls
+```
+
+Shows all saved plans with status and progress. Select one to resume, abandon, switch to, or delete.
+
+### `/plan clean` — Delete completed plans
+
+```bash
+/plan clean
+```
+
+Lists all done / superseded / abandoned plans for deletion. Select which to remove.
+
+### `/plan abandon` — Abandon current plan
+
+```bash
+/plan abandon
+```
+
+Marks the current plan as abandoned (without deleting its files).
+
+### `/plan-settings` — Unified settings
+
+Opens an interactive menu for:
+- Plan model provider + ID + thinking level
+- Exec model provider + ID + thinking level
+- Bash safety mode (blacklist / allowlist)
+- Plan blocked tools (project-level, saved to `.pi/pi-plan.json`)
 
 ### `/todos` — View progress
 
@@ -99,6 +125,30 @@ Config stored in `~/.pi/agent/pi-plan.json`. Also supports environment variables
 | `plan_status` | Any | Read-only snapshot |
 | `reconcile_plans` | Any | Repair task/registry drift |
 
+## Plan Lifecycle
+
+Plans have a lifecycle with automatic state transitions:
+
+| State | Trigger |
+|-------|---------|
+| `in-progress` | Plan submitted via `submit_plan` |
+| `done` | All tasks completed (auto-detected) |
+| `superseded` | New plan started while another was in-progress (auto-detected) |
+| `abandoned` | User marks via `/plan abandon`, or prompted on exit if plan was never executed |
+
+Tracked in `.plans/plans.jsonl`. Use `/plan list` to view, `/plan clean` to remove completed ones.
+
+## Project-Level Tool Blocking
+
+In addition to the default blocked tools (edit/write, exec-only), you can block project-specific tools in plan mode:
+
+```json
+// .pi/pi-plan.json
+{ "planBlockedTools": ["godot_create_node", "godot_set_cell"] }
+```
+
+Configured via `/plan-settings` → option 6, or edit the file manually. This is project-scoped — different projects can have different blocked tools.
+
 ## Blocked Task Handling
 
 When a task is blocked during execution, a menu appears:
@@ -135,7 +185,7 @@ Agent completes tasks → update_task
 
 ## 简介
 
-**@2008muyu/pi-plan** 是一个可配置的双阶段规划扩展。规划用强模型（思考深入），执行用轻模型（省 token），所有模型均可通过 `/plan-config` 自由设置。
+**@2008muyu/pi-plan** 是一个可配置的双阶段规划扩展。规划用强模型（思考深入），执行用轻模型（省 token），所有模型均可通过 `/plan-settings` 统一设置。
 
 ## 安装
 
@@ -164,9 +214,9 @@ pi 自动切换到配置的**规划模型**，工具限制为只读模式。Agen
 
 显示磁盘上所有进行中的方案，选择继续执行或重新规划。
 
-### `/plan-config` — 配置模型
+### `/plan-settings` — 统一设置
 
-交互式设置规划模型和执行模型的 provider、ID 和思考强度。
+交互菜单统一配置规划/执行模型的 provider、ID、思考强度，以及 bash 安全模式。
 
 ### `/todos` — 查看进度
 

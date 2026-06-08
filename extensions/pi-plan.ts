@@ -2,7 +2,7 @@
  * @2008muyu/pi-plan — 可配置双阶段规划扩展
  *
  * Plan with a strong model, execute with a light model.
- * Models are fully configurable via /plan-config.
+ * Models are fully configurable via /plan-settings.
  *
  * 核心流程:
  *   /plan → 只读规划(强模型) → submit_plan → 执行(轻模型) → update_task
@@ -58,9 +58,21 @@ interface PlanConfig {
   bashSafetyMode: 'blacklist' | 'allowlist';
 }
 
-// ── Config ──────────────────────────────────────────────────────────────────
+/** Project-level overrides (only tool blocking for now). */
+interface ProjectConfig {
+  planBlockedTools?: string[];  // tools to block in plan mode (e.g. ['godot_create_node'])
+}
 
-const CONFIG_PATH = join(homedir(), '.pi', 'agent', 'pi-plan.json');
+// ── Config ──────────────────────────────────────────────────────────────────
+//
+// Global config:  ~/.pi/agent/pi-plan.json     — models, thinking, bash mode
+// Project config: .pi/pi-plan.json             — planBlockedTools (project-specific)
+//
+// Merge: DEFAULT → global → project (project overrides global)
+
+const GLOBAL_CONFIG_PATH = join(homedir(), '.pi', 'agent', 'pi-plan.json');
+const PROJECT_CONFIG_DIR = '.pi';
+const PROJECT_CONFIG_FILE = 'pi-plan.json';
 
 const DEFAULT_CONFIG: PlanConfig = {
   planProvider: 'anthropic',
@@ -72,9 +84,13 @@ const DEFAULT_CONFIG: PlanConfig = {
   bashSafetyMode: 'blacklist',
 };
 
-function loadConfig(): PlanConfig {
-  if (existsSync(CONFIG_PATH)) {
-    try { return { ...DEFAULT_CONFIG, ...JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) }; } catch { /* fall through */ }
+const DEFAULT_PROJECT_CONFIG: ProjectConfig = {
+  planBlockedTools: [],
+};
+
+export function loadConfig(): PlanConfig {
+  if (existsSync(GLOBAL_CONFIG_PATH)) {
+    try { return { ...DEFAULT_CONFIG, ...JSON.parse(readFileSync(GLOBAL_CONFIG_PATH, 'utf8')) }; } catch { /* fall through */ }
   }
   return {
     planProvider: process.env.PI_PLAN_PROVIDER || DEFAULT_CONFIG.planProvider,
@@ -87,9 +103,27 @@ function loadConfig(): PlanConfig {
   };
 }
 
-function saveConfig(cfg: PlanConfig): void {
-  mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-  writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+export function saveConfig(cfg: PlanConfig): void {
+  mkdirSync(dirname(GLOBAL_CONFIG_PATH), { recursive: true });
+  writeFileSync(GLOBAL_CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+}
+
+export function projectConfigPath(cwd: string): string {
+  return join(cwd, PROJECT_CONFIG_DIR, PROJECT_CONFIG_FILE);
+}
+
+export function loadProjectConfig(cwd: string): ProjectConfig {
+  const p = projectConfigPath(cwd);
+  if (existsSync(p)) {
+    try { return { ...DEFAULT_PROJECT_CONFIG, ...JSON.parse(readFileSync(p, 'utf8')) }; } catch { /* fall through */ }
+  }
+  return { ...DEFAULT_PROJECT_CONFIG };
+}
+
+export function saveProjectConfig(cwd: string, cfg: ProjectConfig): void {
+  const dir = join(cwd, PROJECT_CONFIG_DIR);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(projectConfigPath(cwd), JSON.stringify(cfg, null, 2) + '\n', 'utf8');
 }
 
 // ── File I/O helpers ────────────────────────────────────────────────────────
@@ -147,7 +181,7 @@ function getBashSafetyMode(): 'blacklist' | 'allowlist' {
 }
 
 /** Check if a bash command is safe in plan mode */
-function isSafeCommand(cmd: string): boolean {
+export function isSafeCommand(cmd: string): boolean {
   const trimmed = cmd.trim();
   if (!trimmed) return true;
   const mode = getBashSafetyMode();
@@ -160,7 +194,7 @@ function isSafeCommand(cmd: string): boolean {
 
 /** Check for shell output redirection that writes to a real file.
  *  Safe patterns like 2>/dev/null, 2>&1, >/dev/null are excluded. */
-function hasOutputRedirect(cmd: string): boolean {
+export function hasOutputRedirect(cmd: string): boolean {
   // Strip safe redirect patterns (discard to /dev/null, fd merging)
   const stripped = cmd
     .replace(/\d*>\s*\/dev\/null/g, '')   // >/dev/null, 2>/dev/null
@@ -171,8 +205,26 @@ function hasOutputRedirect(cmd: string): boolean {
   return /(?:^|\s|[0-9&])>/.test(stripped);
 }
 
-function isPlanPath(filePath: string): boolean {
+export function isPlanPath(filePath: string): boolean {
   return filePath.startsWith(PLANS_ROOT) || filePath.startsWith('.plans\\');
+}
+
+// ── Plan tool resolution (pure functions, module-level for testability) ─────
+
+const PLAN_BLOCKED_TOOLS: ReadonlySet<string> = new Set([
+  'edit', 'write',               // file mutation
+  'update_task', 'update_tasks', // exec-only: mark tasks done/skipped/blocked
+  'add_task',                    // exec-only: capture discovered follow-up
+  'set_active_plan', 'update_plan', // exec-only: plan lifecycle management
+]);
+
+export function resolvePlanTools(allToolNames: string[], projectBlocked: string[]): string[] {
+  const blocked = new Set([...PLAN_BLOCKED_TOOLS, ...projectBlocked]);
+  return allToolNames.filter(n => !blocked.has(n));
+}
+
+export function resolveExecTools(allToolNames: string[]): string[] {
+  return [...allToolNames];
 }
 
 // ── Plugin system prompts ───────────────────────────────────────────────────
@@ -246,8 +298,20 @@ export default function piPlan(pi: ExtensionAPI): void {
   let previousModel: { provider: string; id: string } | undefined;
   let previousThinking: string | undefined;
 
-  const PLAN_TOOLS = ['read', 'bash', 'grep', 'find', 'ls', 'questionnaire', 'submit_plan', 'revise_plan', 'plan_status', 'reconcile_plans'];
-  const EXEC_TOOLS = ['read', 'bash', 'edit', 'write', 'update_task', 'update_tasks', 'add_task', 'plan_status', 'set_active_plan', 'update_plan', 'reconcile_plans'];
+  // Tools blocked in plan mode.
+  // - edit/write: file mutation (blocked by pi-plan, allowed in .plans/ via tool_call interceptor)
+  // - exec-only tools: only meaningful during execution phase
+  // Everything else is auto-discovered from pi.getAllTools() at runtime,
+  // so pi-plan never hardcodes external extension tool names (subagent, team, web_search, etc.).
+  function resolvePlanToolsForCtx(): string[] {
+    const allToolNames = pi.getAllTools().map(t => t.name);
+    const projCfg = loadProjectConfig(process.cwd());
+    return resolvePlanTools(allToolNames, projCfg.planBlockedTools || []);
+  }
+
+  function resolveExecToolsForCtx(): string[] {
+    return resolveExecTools(pi.getAllTools().map(t => t.name));
+  }
 
   // ── State persistence ──────────────────────────────────────────────────────
 
@@ -306,7 +370,7 @@ export default function piPlan(pi: ExtensionAPI): void {
       executionStartIdx = saved.data.executionStartIdx;
     }
     if (pi.getFlag('plan') === true) planModeEnabled = true;
-    if (planModeEnabled) pi.setActiveTools(PLAN_TOOLS);
+    if (planModeEnabled) pi.setActiveTools(resolvePlanToolsForCtx());
     updatePlanIndicator(ctx);
   }
 
@@ -315,7 +379,7 @@ export default function piPlan(pi: ExtensionAPI): void {
   async function switchModel(ctx: ExtensionContext, provider: string, id: string, role: string): Promise<boolean> {
     const model = ctx.modelRegistry.find(provider, id);
     if (!model) {
-      ctx.ui.notify(`[pi-plan] ${role} model ${provider}/${id} not found. Run /plan-config.`, 'error');
+      ctx.ui.notify(`[pi-plan] ${role} model ${provider}/${id} not found. Run /plan-settings.`, 'error');
       return false;
     }
 
@@ -360,6 +424,12 @@ function writePlanFiles(name: string, data: PlanData): void {
     const existing = existsSync(manifestPath) ? readJsonl<any>(manifestPath) : [];
     const existingPlan = existing.find((p: any) => p.name === name);
     const entry = { name, title: data.title, status: 'in-progress' as PlanStatus, created_at: data.tasks[0]?.created_at ?? new Date().toISOString() };
+    // Supersede any other in-progress plan
+    for (const p of existing) {
+      if (p.name !== name && p.status === 'in-progress') {
+        p.status = 'superseded';
+      }
+    }
     if (existingPlan) Object.assign(existingPlan, entry);
     else existing.push(entry);
     writeJsonl(manifestPath, existing);
@@ -386,12 +456,12 @@ function writePlanFiles(name: string, data: PlanData): void {
     plan = undefined;
     previousThinking = pi.getThinkingLevel() as string;
     previousModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
-    pi.setActiveTools(PLAN_TOOLS);
+    pi.setActiveTools(resolvePlanToolsForCtx());
     const config = loadConfig();
     const switched = await switchModel(ctx, config.planProvider, config.planModel, 'Plan');
     if (!switched) {
       planModeEnabled = false;
-      pi.setActiveTools(['read', 'bash', 'edit', 'write']);
+      pi.setActiveTools(resolveExecToolsForCtx());
       ctx.ui.notify('[pi-plan] Could not enter plan mode.', 'error');
       return;
     }
@@ -406,13 +476,13 @@ function writePlanFiles(name: string, data: PlanData): void {
     planModeEnabled = false;
     executing = true;
     executionStartIdx = ctx.sessionManager.getEntries().length;
-    pi.setActiveTools(EXEC_TOOLS);
+    pi.setActiveTools(resolveExecToolsForCtx());
     const config = loadConfig();
     const switched = await switchModel(ctx, config.execProvider, config.execModel, 'Exec');
     if (!switched) {
       executing = false;
       planModeEnabled = true;
-      pi.setActiveTools(PLAN_TOOLS);
+      pi.setActiveTools(resolvePlanToolsForCtx());
       ctx.ui.notify('[pi-plan] Could not start execution.', 'error');
       return;
     }
@@ -422,11 +492,22 @@ function writePlanFiles(name: string, data: PlanData): void {
     updatePlanIndicator(ctx);
   }
 
-  async function exitPlanMode(ctx: ExtensionContext): Promise<void> {
+  async function exitPlanMode(ctx: ExtensionContext, skipPrompt?: boolean): Promise<void> {
+    // If plan has only pending tasks (unexecuted), prompt to abandon
+    if (!skipPrompt && planModeEnabled && plan && plan.tasks.every(t => t.status === 'pending')) {
+      const action = await ctx.ui.select('Plan has not been executed. Abandon it?', [
+        'Yes, abandon',
+        'Keep it',
+      ]);
+      if (action === 'Yes, abandon') {
+        updatePlanStatusInManifest(plan.planName, 'abandoned');
+      }
+    }
+
     planModeEnabled = false;
     executing = false;
     executionStartIdx = undefined;
-    pi.setActiveTools(['read', 'bash', 'edit', 'write']);
+    pi.setActiveTools(resolveExecToolsForCtx());
     if (previousModel) await switchModel(ctx, previousModel.provider, previousModel.id, 'Restore');
     if (previousThinking) pi.setThinkingLevel(previousThinking as any);
     ctx.ui.notify('Plan mode OFF', 'info');
@@ -440,6 +521,17 @@ function writePlanFiles(name: string, data: PlanData): void {
 
   // ── Task update helper ─────────────────────────────────────────────────────
 
+  function updatePlanStatusInManifest(name: string, status: PlanStatus): void {
+    const manifestPath = join(PLANS_ROOT, 'plans.jsonl');
+    if (!existsSync(manifestPath)) return;
+    const entries = readJsonl<any>(manifestPath);
+    const plan = entries.find((p: any) => p.name === name);
+    if (plan && plan.status !== status) {
+      plan.status = status;
+      writeJsonl(manifestPath, entries);
+    }
+  }
+
   async function updateTaskInPlan(taskId: string, status: TaskStatus, notes?: string): Promise<void> {
     if (!plan || !activePlanDir) return;
     const task = plan.tasks.find(t => t.id === taskId);
@@ -452,6 +544,165 @@ function writePlanFiles(name: string, data: PlanData): void {
       ...plan.tasks,
     ]);
     persistState();
+    // Auto-update plan status to 'done' when all tasks complete
+    if (plan && plan.tasks.every(t => t.status === 'done' || t.status === 'skipped' || t.status === 'blocked')) {
+      updatePlanStatusInManifest(plan.planName, 'done');
+    }
+  }
+
+  // ── Plan list UI helper ────────────────────────────────────────────────────
+
+  interface PlanViewEntry {
+    name: string;
+    title: string;
+    status: PlanStatus;
+    done: number;
+    total: number;
+    created_at: string;
+  }
+
+  function readPlansManifest(): PlanViewEntry[] {
+    const manifestPath = join(PLANS_ROOT, 'plans.jsonl');
+    if (!existsSync(manifestPath)) return [];
+    const entries = readJsonl<any>(manifestPath);
+    return entries.map((e: any) => {
+      const dir = planDir(e.name);
+      let done = 0, total = 0;
+      try {
+        const rows = readJsonl<any>(join(dir, 'tasks.jsonl'));
+        const tasks = rows.filter((r: any) => r._type !== 'meta');
+        total = tasks.length;
+        done = tasks.filter((t: any) => t.status === 'done' || t.status === 'skipped').length;
+      } catch { /* corrupted — best effort */ }
+      return { name: e.name, title: e.title, status: e.status, done, total, created_at: e.created_at };
+    });
+  }
+
+  async function showPlanListUI(ctx: ExtensionContext): Promise<void> {
+    const entries = readPlansManifest();
+    if (entries.length === 0) { ctx.ui.notify('No plans found.', 'info'); return; }
+
+    const statusIcon: Record<string, string> = { 'in-progress': '○', done: '✓', superseded: '⊘', abandoned: '✗' };
+    const planLines = entries.map(e => {
+      const icon = statusIcon[e.status] || '?';
+      const progress = `${e.done}/${e.total} tasks`;
+      const date = e.created_at ? new Date(e.created_at).toLocaleDateString() : '';
+      const active = plan && e.name === plan.planName ? ' ← active' : '';
+      return `${icon} ${e.name} (${e.status}) — ${progress} · ${date}${active}`;
+    });
+
+    const picked = await ctx.ui.select('Plans:', planLines);
+    if (!picked) return;
+
+    // Extract plan name from selected line
+    const match = picked.match(/^[○✓⊘✗]\s+([^\s]+)/);
+    if (!match) return;
+    const name = match[1];
+    const entry = entries.find(e => e.name === name);
+    if (!entry) return;
+
+    // Build action menu
+    const actions: string[] = [];
+    if (entry.status === 'in-progress') actions.push('Resume');
+    if (plan && name !== plan.planName) actions.push('Switch to this plan');
+    actions.push('Abandon');
+    actions.push('Delete');
+    actions.push('Cancel');
+
+    const action = await ctx.ui.select(`Plan: ${entry.name} (${entry.status})`, actions);
+    if (!action || action === 'Cancel') return;
+
+    if (action === 'Resume') {
+      const resumed = readPlanFromDisk(planDir(name));
+      if (!resumed) { ctx.ui.notify('Plan data corrupted.', 'error'); return; }
+      activePlanDir = planDir(name);
+      plan = resumed;
+      const pending = plan.tasks.filter(t => t.status === 'pending' || t.status === 'deferred');
+      const mode = await ctx.ui.select(`Resume "${plan.title}" — ${pending.length} pending`, [
+        'Continue execution',
+        'Re-enter plan mode',
+        'Cancel',
+      ]);
+      if (mode === 'Continue execution') {
+        await startExecution(ctx);
+        if (pending.length > 0) pi.sendUserMessage(`Resuming plan. Start with ${pending[0].id}: ${pending[0].description}`, { deliverAs: 'followUp' });
+      } else if (mode === 'Re-enter plan mode') {
+        await enterPlanMode(ctx);
+        pi.sendUserMessage(`Back in plan mode for "${plan.title}".`, { deliverAs: 'followUp' });
+      }
+      return;
+    }
+
+    if (action === 'Switch to this plan') {
+      const resumed = readPlanFromDisk(planDir(name));
+      if (!resumed) { ctx.ui.notify('Plan data corrupted.', 'error'); return; }
+      activePlanDir = planDir(name);
+      plan = resumed;
+      ctx.ui.notify(`Switched to plan "${plan.title}".`, 'info');
+      return;
+    }
+
+    if (action === 'Abandon') {
+      updatePlanStatusInManifest(name, 'abandoned');
+      ctx.ui.notify(`Plan "${entry.title}" abandoned.`, 'info');
+      return;
+    }
+
+    if (action === 'Delete') {
+      const confirm = await ctx.ui.select(`Delete plan "${entry.title}"? This cannot be undone.`, ['Yes, delete', 'Cancel']);
+      if (confirm !== 'Yes, delete') return;
+      const dir = planDir(name);
+      if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+      // Remove from manifest
+      const manifestPath = join(PLANS_ROOT, 'plans.jsonl');
+      if (existsSync(manifestPath)) {
+        const entries2 = readJsonl<any>(manifestPath);
+        const filtered = entries2.filter((e: any) => e.name !== name);
+        writeJsonl(manifestPath, filtered);
+      }
+      // Clear active plan if deleted
+      if (plan && plan.planName === name) { plan = undefined; activePlanDir = undefined; }
+      ctx.ui.notify(`Plan "${entry.title}" deleted.`, 'info');
+    }
+  }
+
+  async function cleanCompletedPlans(ctx: ExtensionContext): Promise<void> {
+    const entries = readPlansManifest();
+    const deletable = entries.filter(e => e.status === 'done' || e.status === 'superseded' || e.status === 'abandoned');
+    if (deletable.length === 0) { ctx.ui.notify('No completed plans to clean.', 'info'); return; }
+
+    const planLines = deletable.map(e => {
+      const progress = `${e.done}/${e.total} tasks`;
+      const date = e.created_at ? new Date(e.created_at).toLocaleDateString() : '';
+      return `${e.name} (${e.status}) — ${progress} · ${date}`;
+    });
+
+    const picked = await ctx.ui.select('Select plan to delete (ESC to finish):', [...planLines, 'Done cleaning']);
+    if (!picked || picked === 'Done cleaning') return;
+
+    const name = picked.replace(/\s*\(.*$/, '');
+    const entry = deletable.find(e => e.name === name);
+    if (!entry) return;
+
+    if (plan && plan.planName === name) {
+      ctx.ui.notify('Cannot delete active plan. Abandon it first.', 'warning');
+      return;
+    }
+
+    const confirm = await ctx.ui.select(`Delete plan "${entry.title}"?`, ['Yes, delete', 'Cancel']);
+    if (confirm !== 'Yes, delete') return;
+
+    const dir = planDir(name);
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    const manifestPath = join(PLANS_ROOT, 'plans.jsonl');
+    if (existsSync(manifestPath)) {
+      const all = readJsonl<any>(manifestPath);
+      writeJsonl(manifestPath, all.filter((e: any) => e.name !== name));
+    }
+    ctx.ui.notify(`Plan "${entry.title}" deleted.`, 'info');
+
+    // Loop for more
+    await cleanCompletedPlans(ctx);
   }
 
   // ── Flag ───────────────────────────────────────────────────────────────────
@@ -704,7 +955,7 @@ function writePlanFiles(name: string, data: PlanData): void {
   // ── Commands ───────────────────────────────────────────────────────────────
 
   pi.registerCommand('plan', {
-    description: 'Enter plan mode. "/plan resume" picks up an existing plan. "/plan exit" leaves plan or exec mode.',
+    description: 'Enter plan mode. "/plan resume" picks up an existing plan. "/plan exit" leaves plan or exec mode. "/plan abandon" marks current plan as abandoned. "/plan list" shows all plans. "/plan clean" deletes completed plans.',
     handler: async (args, ctx) => {
       const trimmed = args?.trim();
 
@@ -715,6 +966,20 @@ function writePlanFiles(name: string, data: PlanData): void {
           return;
         }
         await exitPlanMode(ctx);
+        return;
+      }
+
+      // ── /plan abandon : mark current plan as abandoned ───────────────────
+      if (trimmed === 'abandon') {
+        if (!plan) { ctx.ui.notify('No active plan to abandon.', 'info'); return; }
+        const confirm = await ctx.ui.select(`Abandon plan "${plan.title}"?`, [
+          'Yes, abandon',
+          'Cancel',
+        ]);
+        if (confirm !== 'Yes, abandon') return;
+        updatePlanStatusInManifest(plan.planName, 'abandoned');
+        if (planModeEnabled || executing) await exitPlanMode(ctx);
+        ctx.ui.notify(`Plan "${plan.title}" abandoned.`, 'info');
         return;
       }
 
@@ -759,6 +1024,18 @@ function writePlanFiles(name: string, data: PlanData): void {
         return;
       }
 
+      // ── /plan list | ls : show all plans ─────────────────────────────────
+      if (trimmed === 'list' || trimmed === 'ls') {
+        await showPlanListUI(ctx);
+        return;
+      }
+
+      // ── /plan clean : delete completed plans ─────────────────────────────
+      if (trimmed === 'clean') {
+        await cleanCompletedPlans(ctx);
+        return;
+      }
+
       // Toggle plan mode
       if (planModeEnabled || executing) {
         await exitPlanMode(ctx);
@@ -779,10 +1056,21 @@ function writePlanFiles(name: string, data: PlanData): void {
     },
   });
 
-  pi.registerCommand('plan-config', {
-    description: 'Configure plan/exec models (picks from your configured providers).',
+  // ── applyConfigIfActive: immediate live-apply when in plan/exec mode ────────
+
+  async function applyConfigIfActive(ctx: ExtensionContext, cfg: PlanConfig): Promise<void> {
+    if (planModeEnabled) {
+      const switched = await switchModel(ctx, cfg.planProvider, cfg.planModel, 'Plan');
+      if (switched) pi.setThinkingLevel(cfg.planThinking as any);
+    } else if (executing) {
+      const switched = await switchModel(ctx, cfg.execProvider, cfg.execModel, 'Exec');
+      if (switched) pi.setThinkingLevel(cfg.execThinking as any);
+    }
+  }
+
+  pi.registerCommand('plan-settings', {
+    description: 'Unified settings: plan/exec models, thinking, bash safety mode.',
     handler: async (_args, ctx) => {
-      const cfg = loadConfig();
       const allModels = ctx.modelRegistry?.getAvailable() || [];
       if (allModels.length === 0) { ctx.ui.notify('No models configured. Use /login first.', 'error'); return; }
 
@@ -795,7 +1083,9 @@ function writePlanFiles(name: string, data: PlanData): void {
       }
       const providers = [...byProvider.keys()];
 
-      // Helper: pick model for a role
+      const THINKING_OPTIONS = ['off', 'low', 'medium', 'high'];
+
+      // Helper: pick provider → model
       async function pickModel(role: string, currentP: string, currentM: string): Promise<{ provider: string; model: string } | undefined> {
         const provLabel = await ctx.ui.select(`${role} — provider:`, providers.map(p => `${p}${p === currentP ? ' (current)' : ''}`));
         if (!provLabel) return undefined;
@@ -806,45 +1096,82 @@ function writePlanFiles(name: string, data: PlanData): void {
         return { provider: prov, model: modelLabel.replace(/\s*\(current\)$/, '') };
       }
 
-      const plan = await pickModel('Planning (strong)', cfg.planProvider, cfg.planModel);
-      if (!plan) return;
-      cfg.planProvider = plan.provider;
-      cfg.planModel = plan.model;
+      let exit = false;
+      while (!exit) {
+        const cfg = loadConfig();
+        const choices = [
+          `1. Plan model: ${cfg.planProvider}/${cfg.planModel}`,
+          `2. Plan thinking: ${cfg.planThinking}`,
+          '',
+          `3. Exec model: ${cfg.execProvider}/${cfg.execModel}`,
+          `4. Exec thinking: ${cfg.execThinking}`,
+          '',
+          `5. Bash safety mode: ${cfg.bashSafetyMode}`,
+          `6. Plan blocked tools: ${(loadProjectConfig(ctx.cwd).planBlockedTools || []).join(', ') || '(none)'}`,
+          '',
+          '0. Exit',
+        ];
 
-      const exec = await pickModel('Execution (light)', cfg.execProvider, cfg.execModel);
-      if (!exec) return;
-      cfg.execProvider = exec.provider;
-      cfg.execModel = exec.model;
+        const answer = await ctx.ui.select('Plan Settings', choices);
+        if (!answer) { exit = true; break; }
 
-      saveConfig(cfg);
-      ctx.ui.notify(`Plan config saved: plan=${cfg.planProvider}/${cfg.planModel}  exec=${cfg.execProvider}/${cfg.execModel}`, 'info');
-
-      // Immediately apply if already in plan/exec mode
-      if (planModeEnabled) {
-        const switched = await switchModel(ctx, cfg.planProvider, cfg.planModel, 'Plan');
-        if (switched) pi.setThinkingLevel(cfg.planThinking as any);
-      } else if (executing) {
-        const switched = await switchModel(ctx, cfg.execProvider, cfg.execModel, 'Exec');
-        if (switched) pi.setThinkingLevel(cfg.execThinking as any);
+        if (answer.startsWith('1.')) {
+          const picked = await pickModel('Plan model (planning, strong)', cfg.planProvider, cfg.planModel);
+          if (!picked) continue;
+          cfg.planProvider = picked.provider;
+          cfg.planModel = picked.model;
+          saveConfig(cfg);
+          await applyConfigIfActive(ctx, cfg);
+          ctx.ui.notify(`Plan model → ${cfg.planProvider}/${cfg.planModel}`, 'info');
+        } else if (answer.startsWith('2.')) {
+          const level = await ctx.ui.select('Plan thinking level', THINKING_OPTIONS);
+          if (!level) continue;
+          cfg.planThinking = level;
+          saveConfig(cfg);
+          await applyConfigIfActive(ctx, cfg);
+          ctx.ui.notify(`Plan thinking → ${cfg.planThinking}`, 'info');
+        } else if (answer.startsWith('3.')) {
+          const picked = await pickModel('Exec model (execution, light)', cfg.execProvider, cfg.execModel);
+          if (!picked) continue;
+          cfg.execProvider = picked.provider;
+          cfg.execModel = picked.model;
+          saveConfig(cfg);
+          await applyConfigIfActive(ctx, cfg);
+          ctx.ui.notify(`Exec model → ${cfg.execProvider}/${cfg.execModel}`, 'info');
+        } else if (answer.startsWith('4.')) {
+          const level = await ctx.ui.select('Exec thinking level', THINKING_OPTIONS);
+          if (!level) continue;
+          cfg.execThinking = level;
+          saveConfig(cfg);
+          await applyConfigIfActive(ctx, cfg);
+          ctx.ui.notify(`Exec thinking → ${cfg.execThinking}`, 'info');
+        } else if (answer.startsWith('5.')) {
+          const mode = await ctx.ui.select('Bash safety mode', [
+            `blacklist${cfg.bashSafetyMode === 'blacklist' ? ' (current)' : ''}`,
+            `allowlist${cfg.bashSafetyMode === 'allowlist' ? ' (current)' : ''}`,
+          ]);
+          if (!mode) continue;
+          const clean = mode.replace(/\s*\(current\)$/, '') as 'blacklist' | 'allowlist';
+          cfg.bashSafetyMode = clean;
+          saveConfig(cfg);
+          ctx.ui.notify(`Bash safety mode → ${cfg.bashSafetyMode}`, 'info');
+        } else if (answer.startsWith('6.')) {
+          // Project-level: show all non-blocked tools, let user pick which to block
+          const allToolNames = pi.getAllTools().map(t => t.name);
+          const projCfg = loadProjectConfig(ctx.cwd);
+          const currentBlocked = new Set([...PLAN_BLOCKED_TOOLS, ...(projCfg.planBlockedTools || [])]);
+          const blockable = allToolNames.filter(n => !currentBlocked.has(n));
+          if (blockable.length === 0) { ctx.ui.notify('All tools already blocked.', 'info'); continue; }
+          const toolName = await ctx.ui.select('Block tool in plan mode (ESC to cancel):', blockable);
+          if (!toolName) continue;
+          const blocked = [...(projCfg.planBlockedTools || []), toolName];
+          saveProjectConfig(ctx.cwd, { planBlockedTools: blocked });
+          ctx.ui.notify(`Plan blocked tools → ${blocked.join(', ')} (saved to .pi/pi-plan.json)`, 'info');
+        } else if (answer.startsWith('0.')) {
+          exit = true;
+        }
+        // else (blank separator or section header) → loop
       }
-    },
-  });
-
-  pi.registerCommand('plan-safe-mode', {
-    description: 'Set bash safety mode: blacklist (default) or allowlist. /plan-safe-mode to toggle, /plan-safe-mode [blacklist|allowlist] to set explicitly.',
-    handler: async (args, ctx) => {
-      const cfg = loadConfig();
-      const current = cfg.bashSafetyMode;
-      if (!args?.trim()) {
-        cfg.bashSafetyMode = current === 'blacklist' ? 'allowlist' : 'blacklist';
-      } else if (args.trim() === 'blacklist' || args.trim() === 'allowlist') {
-        cfg.bashSafetyMode = args.trim() as any;
-      } else {
-        ctx.ui.notify(`Usage: /plan-safe-mode [blacklist|allowlist]. Current: ${current}`, 'info');
-        return;
-      }
-      saveConfig(cfg);
-      ctx.ui.notify(`Bash safety mode → ${cfg.bashSafetyMode}`, 'info');
     },
   });
 
@@ -868,7 +1195,7 @@ function writePlanFiles(name: string, data: PlanData): void {
     ]);
 
     if (choice === '退出并执行') {
-      await exitPlanMode(ctx);
+      await exitPlanMode(ctx, true);
       // Allow the tool call (the block was a false positive or user wants to
       // execute it anyway). exitPlanMode already injected a follow-up message
       // that triggers a new clean turn.
@@ -887,7 +1214,7 @@ function writePlanFiles(name: string, data: PlanData): void {
     if (event.toolName === 'bash') {
       const cmd = event.input.command as string;
       if (!isSafeCommand(cmd) || hasOutputRedirect(cmd)) {
-        originalReason = `Plan mode (${getBashSafetyMode()}): command blocked. Use /plan to exit, /plan-safe-mode to switch.
+        originalReason = `Plan mode (${getBashSafetyMode()}): command blocked. Use /plan to exit, /plan-settings to switch.
 Command: ${cmd}`;
       }
     }
@@ -908,7 +1235,7 @@ Command: ${cmd}`;
 
   pi.on('before_agent_start', async () => {
     if (planModeEnabled) {
-      return { message: { customType: 'pi-plan-context', content: buildPlanModePrompt(PLAN_TOOLS), display: false } };
+      return { message: { customType: 'pi-plan-context', content: buildPlanModePrompt(resolvePlanToolsForCtx()), display: false } };
     }
     if (executing && plan) {
       const remaining = plan.tasks.filter(t => t.status === 'pending' || t.status === 'deferred');
