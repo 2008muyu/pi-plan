@@ -14,7 +14,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { getKeybindings, Key, matchesKey } from '@earendil-works/pi-tui';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, readdirSync, rmSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -211,7 +211,7 @@ export function isPlanPath(filePath: string): boolean {
 
 // ── Plan tool resolution (pure functions, module-level for testability) ─────
 
-const PLAN_BLOCKED_TOOLS: ReadonlySet<string> = new Set([
+export const PLAN_BLOCKED_TOOLS: ReadonlySet<string> = new Set([
   'edit', 'write',               // file mutation
   'update_task', 'update_tasks', // exec-only: mark tasks done/skipped/blocked
   'add_task',                    // exec-only: capture discovered follow-up
@@ -649,6 +649,14 @@ function writePlanFiles(name: string, data: PlanData): void {
     }
 
     if (action === 'Delete') {
+      // Warn if deleting an active in-progress plan
+      if (plan && plan.planName === name && entry.status === 'in-progress') {
+        const c = await ctx.ui.select(
+          `Plan "${entry.title}" is in-progress and currently active. Delete anyway?`,
+          ['Yes, delete', 'Cancel']
+        );
+        if (c !== 'Yes, delete') return;
+      }
       const confirm = await ctx.ui.select(`Delete plan "${entry.title}"? This cannot be undone.`, ['Yes, delete', 'Cancel']);
       if (confirm !== 'Yes, delete') return;
       const dir = planDir(name);
@@ -671,23 +679,49 @@ function writePlanFiles(name: string, data: PlanData): void {
     const deletable = entries.filter(e => e.status === 'done' || e.status === 'superseded' || e.status === 'abandoned');
     if (deletable.length === 0) { ctx.ui.notify('No completed plans to clean.', 'info'); return; }
 
+    const statusIcon: Record<string, string> = { 'in-progress': '○', done: '✓', superseded: '⊘', abandoned: '✗' };
     const planLines = deletable.map(e => {
+      const icon = statusIcon[e.status] || '?';
       const progress = `${e.done}/${e.total} tasks`;
       const date = e.created_at ? new Date(e.created_at).toLocaleDateString() : '';
-      return `${e.name} (${e.status}) — ${progress} · ${date}`;
+      return `${icon} ${e.name} (${e.status}) — ${progress} · ${date}`;
     });
 
-    const picked = await ctx.ui.select('Select plan to delete (ESC to finish):', [...planLines, 'Done cleaning']);
+    // Add bulk action at the top
+    const menuItems = [`🗑 Delete all (${deletable.length} plans)`, '', ...planLines, 'Done cleaning'];
+
+    const picked = await ctx.ui.select('Select plan to delete (ESC to finish):', menuItems);
     if (!picked || picked === 'Done cleaning') return;
 
-    const name = picked.replace(/\s*\(.*$/, '');
-    const entry = deletable.find(e => e.name === name);
-    if (!entry) return;
-
-    if (plan && plan.planName === name) {
-      ctx.ui.notify('Cannot delete active plan. Abandon it first.', 'warning');
+    // ── Bulk delete all ────────────────────────────────────────────────────
+    if (picked.startsWith('🗑 Delete all')) {
+      const activeName = plan?.planName;
+      const toDelete = deletable.filter(e => e.name !== activeName);
+      if (toDelete.length === 0) { ctx.ui.notify('No plans to delete (active plan excluded).', 'info'); return; }
+      const confirm = await ctx.ui.select(`Delete ${toDelete.length} plan(s)? This cannot be undone.`, ['Yes, delete all', 'Cancel']);
+      if (confirm !== 'Yes, delete all') return;
+      const manifestPath = join(PLANS_ROOT, 'plans.jsonl');
+      for (const e of toDelete) {
+        const dir = planDir(e.name);
+        if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+      }
+      if (existsSync(manifestPath)) {
+        const all = readJsonl<any>(manifestPath);
+        const deletedNames = new Set(toDelete.map(e => e.name));
+        writeJsonl(manifestPath, all.filter((e: any) => !deletedNames.has(e.name)));
+      }
+      if (activeName) ctx.ui.notify(`Deleted ${toDelete.length} plan(s). Active plan "${activeName}" kept.`, 'info');
+      else ctx.ui.notify(`Deleted ${toDelete.length} plan(s).`, 'info');
       return;
     }
+
+    // ── Single delete ──────────────────────────────────────────────────────
+    const pickMatch = picked.match(/^[○✓⊘✗]\s+([^\s(]+)/);
+    const name = pickMatch?.[1] || '';
+    if (!name) return;
+
+    const entry = deletable.find(e => e.name === name);
+    if (!entry) return;
 
     const confirm = await ctx.ui.select(`Delete plan "${entry.title}"?`, ['Yes, delete', 'Cancel']);
     if (confirm !== 'Yes, delete') return;
@@ -955,7 +989,7 @@ function writePlanFiles(name: string, data: PlanData): void {
   // ── Commands ───────────────────────────────────────────────────────────────
 
   pi.registerCommand('plan', {
-    description: 'Enter plan mode. "/plan resume" picks up an existing plan. "/plan exit" leaves plan or exec mode. "/plan abandon" marks current plan as abandoned. "/plan list" shows all plans. "/plan clean" deletes completed plans.',
+    description: 'Plan mode + subcommands: list|ls, clean, resume, abandon, exit|off|out, help. Try /plan help.',
     handler: async (args, ctx) => {
       const trimmed = args?.trim();
 
@@ -1036,6 +1070,29 @@ function writePlanFiles(name: string, data: PlanData): void {
         return;
       }
 
+      // ── /plan help : show available subcommands ─────────────────────────
+      if (trimmed === 'help' || trimmed === '-h' || trimmed === '--help') {
+        ctx.ui.notify(
+          '📋 Available subcommands:\n' +
+          '  /plan           — Toggle plan mode\n' +
+          '  /plan exit|off|out — Leave plan mode\n' +
+          '  /plan list|ls   — Show all plans\n' +
+          '  /plan clean     — Delete completed plans\n' +
+          '  /plan resume    — Resume a saved plan\n' +
+          '  /plan abandon   — Mark current plan as abandoned\n' +
+          '  /plan help      — Show this help\n' +
+          '  /todos          — Show current plan progress',
+          'info'
+        );
+        return;
+      }
+
+      // ── Unknown subcommand → show help ──────────────────────────────────
+      if (trimmed && trimmed !== '') {
+        ctx.ui.notify(`Unknown subcommand: /plan ${trimmed}. Try /plan help for available commands.`, 'warning');
+        return;
+      }
+
       // Toggle plan mode
       if (planModeEnabled || executing) {
         await exitPlanMode(ctx);
@@ -1043,6 +1100,89 @@ function writePlanFiles(name: string, data: PlanData): void {
         await enterPlanMode(ctx);
         if (trimmed) pi.sendUserMessage(trimmed);
       }
+    },
+  });
+
+  // ── Independent subcommands (CLI Tab-completable) ──────────────────────────
+
+  pi.registerCommand('plan-list', {
+    description: 'Show all plans (alias for /plan list)',
+    handler: async (_args, ctx) => { await showPlanListUI(ctx); },
+  });
+
+  pi.registerCommand('plan-clean', {
+    description: 'Delete completed plans (alias for /plan clean)',
+    handler: async (_args, ctx) => { await cleanCompletedPlans(ctx); },
+  });
+
+  pi.registerCommand('plan-abandon', {
+    description: 'Mark current plan as abandoned',
+    handler: async (_args, ctx) => {
+      if (!plan) { ctx.ui.notify('No active plan to abandon.', 'info'); return; }
+      const confirm = await ctx.ui.select(`Abandon plan "${plan.title}"?`, ['Yes, abandon', 'Cancel']);
+      if (confirm !== 'Yes, abandon') return;
+      updatePlanStatusInManifest(plan.planName, 'abandoned');
+      if (planModeEnabled || executing) await exitPlanMode(ctx);
+      ctx.ui.notify(`Plan "${plan.title}" abandoned.`, 'info');
+    },
+  });
+
+  pi.registerCommand('plan-resume', {
+    description: 'Resume a saved plan (alias for /plan resume)',
+    handler: async (_args, ctx) => {
+      if (!existsSync(PLANS_ROOT)) { ctx.ui.notify('No plans directory.', 'info'); return; }
+      const dirs = readdirSync(PLANS_ROOT).filter(d => {
+        try { return existsSync(join(PLANS_ROOT, d, 'tasks.jsonl')) && existsSync(join(PLANS_ROOT, d, 'PLAN.md')); } catch { return false; }
+      });
+      if (dirs.length === 0) { ctx.ui.notify('No saved plans found.', 'info'); return; }
+      const choice = await ctx.ui.select('Resume plan:', dirs);
+      if (!choice) return;
+      const resumed = readPlanFromDisk(planDir(choice));
+      if (!resumed) { ctx.ui.notify('Plan data corrupted.', 'error'); return; }
+      activePlanDir = planDir(choice);
+      plan = resumed;
+      const pending = plan.tasks.filter(t => t.status === 'pending' || t.status === 'deferred');
+      if (pending.length === 0 && plan.tasks.every(t => t.status === 'done' || t.status === 'skipped')) {
+        ctx.ui.notify(`Plan "${plan.title}" already complete.`, 'info');
+        return;
+      }
+      const mode = await ctx.ui.select(`Resume "${plan.title}" — ${pending.length} pending tasks`, [
+        'Continue execution', 'Re-enter plan mode', 'Cancel',
+      ]);
+      if (mode === 'Continue execution') {
+        await startExecution(ctx);
+        if (pending.length > 0) pi.sendUserMessage(`Resuming plan "${plan.title}". Current task: ${pending[0].id}. ${pending[0].description}`);
+      } else if (mode === 'Re-enter plan mode') {
+        await enterPlanMode(ctx);
+        pi.sendUserMessage(`Back in plan mode for "${plan.title}". What needs to change?`);
+      }
+    },
+  });
+
+  pi.registerCommand('plan-exit', {
+    description: 'Leave plan/exec mode (alias for /plan exit)',
+    handler: async (_args, ctx) => {
+      if (!planModeEnabled && !executing) { ctx.ui.notify('Not in plan mode.', 'info'); return; }
+      await exitPlanMode(ctx);
+    },
+  });
+
+  pi.registerCommand('plan-help', {
+    description: 'Show /plan subcommand help',
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(
+        '📋 Available subcommands:\n' +
+        '  /plan           — Toggle plan mode\n' +
+        '  /plan-list      — Show all plans\n' +
+        '  /plan-clean     — Delete completed plans\n' +
+        '  /plan-resume    — Resume a saved plan\n' +
+        '  /plan-abandon   — Mark current plan as abandoned\n' +
+        '  /plan-exit      — Leave plan mode\n' +
+        '  /plan-help      — Show this help\n' +
+        '  /plan-settings  — Configure models/bash/tools\n' +
+        '  /todos          — Show current plan progress',
+        'info'
+      );
     },
   });
 
