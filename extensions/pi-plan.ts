@@ -930,7 +930,7 @@ function writePlanFiles(name: string, data: PlanData): void {
     name: 'reconcile_plans',
     description: 'Detect & repair drift between tasks.jsonl and the registry.',
     parameters: { type: 'object', properties: {} } as any,
-    execute: async (_id: string, _signal: AbortSignal | undefined, _onUpdate: any, _ctx: ExtensionContext) => {
+    execute: async (_id: string, _args: any, _signal: AbortSignal | undefined, _onUpdate: any, _ctx: ExtensionContext) => {
       const manifestPath = join(PLANS_ROOT, 'plans.jsonl');
       if (!existsSync(manifestPath)) return ok('No plans directory.');
       const entries = readJsonl<any>(manifestPath);
